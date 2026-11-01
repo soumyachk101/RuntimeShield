@@ -159,6 +159,32 @@ func (s *dbStore) ListDevices(ctx context.Context, org string) ([]Device, error)
 	return out, rows.Err()
 }
 
+// --- users --------------------------------------------------------------------
+
+// ListUsers returns the members of an organisation. The reference build has
+// no user-management writes; this is the read the console's team-admin
+// screen needs (spec §4.1 FR-08: manage users).
+func (s *dbStore) ListUsers(ctx context.Context, org string) ([]User, error) {
+	q := `SELECT id, organization_id, identity_provider_id, role
+		FROM users WHERE organization_id = ? ORDER BY id`
+	rows, err := s.query(ctx, q, org)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := []User{}
+	for rows.Next() {
+		var u User
+		var idp sql.NullString
+		if err := rows.Scan(&u.ID, &u.OrganizationID, &idp, &u.Role); err != nil {
+			return nil, err
+		}
+		u.IdentityProviderID = idp.String
+		out = append(out, u)
+	}
+	return out, rows.Err()
+}
+
 // --- policies -----------------------------------------------------------------
 
 func (s *dbStore) CreatePolicy(ctx context.Context, p Policy) error {
