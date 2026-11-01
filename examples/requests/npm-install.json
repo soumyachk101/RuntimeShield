@@ -1,0 +1,32 @@
+{
+  "request_id": "demo-0003",
+  "executable": "npm",
+  "argv": [
+    "npm",
+    "install",
+    "typescript",
+    "--no-audit"
+  ],
+  "cwd": "~/repo",
+  "workspace": "repo-w1",
+  "capabilities": [
+    {
+      "kind": "process",
+      "executable": "npm"
+    },
+    {
+      "kind": "fs_write",
+      "path": "node_modules"
+    },
+    {
+      "kind": "network",
+      "host": "registry.npmjs.org",
+      "port": 443
+    }
+  ],
+  "env_keys_requested": [
+    "NPM_CONFIG_REGISTRY"
+  ],
+  "principal_id": "claude-code",
+  "principal": "agent"
+}
