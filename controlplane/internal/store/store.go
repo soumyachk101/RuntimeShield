@@ -39,8 +39,10 @@ type Store interface {
 	// Repositories
 	UpsertOrg(ctx context.Context, o Org) error
 	UpsertDevice(ctx context.Context, d Device) error
+	ListUsers(ctx context.Context, org string) ([]User, error)
 	Heartbeat(ctx context.Context, deviceID string) error
 	ListDevices(ctx context.Context, org string) ([]Device, error)
+	NextPolicyVersion(ctx context.Context, org string) (int, error)
 	CreatePolicy(ctx context.Context, p Policy) error
 	SetPolicyStatus(ctx context.Context, id, status string) error
 	LatestPolicyForOrg(ctx context.Context, org string) (*Policy, error)
@@ -48,11 +50,22 @@ type Store interface {
 	CreateApproval(ctx context.Context, a Approval) error
 	SetApprovalStatus(ctx context.Context, id, status string) error
 	PendingApprovals(ctx context.Context) ([]Approval, error)
+	ListApprovals(ctx context.Context, status string) ([]Approval, error)
 	InsertExecutionRequest(ctx context.Context, r ExecutionRequest) error
 	ListExecutionsForWorkspace(ctx context.Context, workspace string, limit int) ([]ExecutionRequest, error)
 	InsertDecision(ctx context.Context, d Decision) error
 	ListDecisions(ctx context.Context, limit int) ([]Decision, error)
+	ListDecisionsFiltered(ctx context.Context, f DecisionFilter) ([]Decision, error)
 	InsertEvent(ctx context.Context, e ExecEvent) error
+}
+
+// DecisionFilter narrows a decision read for the audit timeline. Empty
+// fields mean "no constraint on that axis".
+type DecisionFilter struct {
+	DeviceID    string // via execution_requests.device_id
+	PolicyVersion string
+	Decision    string // allow | deny | require_approval | audit_only
+	Limit       int
 }
 
 // NewStore opens the configured backend.
