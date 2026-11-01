@@ -1,0 +1,91 @@
+# RuntimeShield CI — three independent jobs mirroring the three components.
+#
+#   rust          cargo test + cargo check for the agent workspace
+#   controlplane  go vet / build / test for the Go API
+#   web           tsc typecheck + vite build for the console
+#
+# The jobs are independent: a gap in one component does not block the
+# others, and the lead runs the full validation locally regardless.
+name: ci
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  rust:
+    name: rust agent
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: rust
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install stable toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+
+      - name: Cargo test (core + agent)
+        run: cargo test
+
+      - name: Cargo check (workspace)
+        run: cargo check --workspace --all-targets
+
+  controlplane:
+    name: go control plane
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: controlplane
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: "1.22"
+
+      # No go.sum is committed in this repo yet (see
+      # deploy/NOTES-AND-GAPS.md gap #3), so download modules first and
+      # build/test with -mod=mod (same workaround as controlplane/Dockerfile).
+      - name: Download modules
+        run: go mod download
+
+      - name: go vet
+        run: go vet -mod=mod ./...
+
+      - name: go build
+        run: go build -mod=mod ./...
+
+      - name: go test
+        run: go test -mod=mod ./...
+
+  web:
+    name: web console
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: web
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      # No lockfile is committed yet (reproducible installs need
+      # package-lock.json), so use npm install, not npm ci.
+      - name: Install dependencies
+        run: npm install --no-audit --no-fund
+
+      - name: Typecheck
+        run: npm run typecheck
+
+      - name: Build (vite)
+        run: npm run build
