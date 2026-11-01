@@ -1,0 +1,23 @@
+{
+  "version": 1,
+  "policy_version": "0.1.0",
+  "profile": "restricted",
+  "description": "Minimal-privilege CI profile: read-only workspace, no network.",
+  "default_action": "deny",
+  "filesystem": {
+    "workspace": { "access": "read-only", "roots": ["~/repo"] },
+    "temp": { "access": "deny" },
+    "sensitive_paths": ["~/.ssh", "~/.aws", "~/.config/gcloud"]
+  },
+  "network": { "default": "deny" },
+  "process": {
+    "allow": [
+      { "executable": "git", "actions": ["status", "diff", "log"] }
+    ],
+    "require_approval": [{ "executable": "cargo" }],
+    "deny": [{ "executable": "sudo" }, { "executable": "curl" }, { "executable": "wget" }]
+  },
+  "secrets": {
+    "deny_env_keys": ["AWS_ACCESS_KEY_ID", "GITHUB_TOKEN", "OPENAI_API_KEY", "DATABASE_URL"]
+  }
+}
