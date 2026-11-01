@@ -67,10 +67,8 @@ func (s *Server) Routes(mux *http.ServeMux) {
 			devicePolicy(w, r, s)
 		case r.URL.Path == "/v1/events/batch" && r.Method == http.MethodPost:
 			eventsBatch(w, r, s)
-		case r.URL.Path == "/v1/approvals" && r.Method == http.MethodPost:
-			approvalsCreate(w, r, s)
-		case strings.HasPrefix(r.URL.Path, "/v1/approvals/") && strings.HasSuffix(r.URL.Path, "/decision") && r.Method == http.MethodPost:
-			approvalsDecide(w, r, s)
+		case strings.HasPrefix(r.URL.Path, "/v1/devices/") && strings.HasSuffix(r.URL.Path, "/token") && r.Method == http.MethodPost:
+			deviceToken(w, r, s)
 		case strings.HasPrefix(r.URL.Path, "/v1/workspaces/") && strings.HasSuffix(r.URL.Path, "/executions") && r.Method == http.MethodGet:
 			workspaceExecutions(w, r, s)
 		default:
@@ -80,13 +78,21 @@ func (s *Server) Routes(mux *http.ServeMux) {
 	mux.Handle("/v1/healthz", public)
 	mux.Handle("/v1/devices/", public)
 	mux.Handle("/v1/events/", public)
-	mux.Handle("/v1/approvals/", public)
 	mux.Handle("/v1/workspaces/", public)
 
-	// Operator console: session-authenticated.
-	mux.Handle("/v1/policies", operatorRoute(s, http.HandlerFunc(policiesList)))
+	// Operator console: session-authenticated. Approvals are operator
+	// actions (a human approves/denies a REQUIRE_APPROVAL request); the
+	// Rust agent records local approvals in its own journal, so the
+	// control-plane approval endpoints serve the team console, not the
+	// device.
+	mux.Handle("/v1/policies", operatorRoute(s, http.HandlerFunc(policiesDispatch)))
+	mux.Handle("/v1/policies/", operatorRoute(s, http.HandlerFunc(policiesDispatch)))
 	mux.Handle("/v1/organizations", operatorRoute(s, http.HandlerFunc(orgsList)))
+	mux.Handle("/v1/users", operatorRoute(s, http.HandlerFunc(usersList)))
 	mux.Handle("/v1/devices", operatorRoute(s, http.HandlerFunc(devicesList)))
+	mux.Handle("/v1/decisions", operatorRoute(s, http.HandlerFunc(decisionsList)))
+	mux.Handle("/v1/approvals", operatorRoute(s, http.HandlerFunc(approvalsDispatch)))
+	mux.Handle("/v1/approvals/", operatorRoute(s, http.HandlerFunc(approvalsDispatch)))
 }
 
 // operatorRoute requires a valid session cookie or operator bearer.
