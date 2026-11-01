@@ -1,0 +1,37 @@
+{
+  "version": 1,
+  "policy_version": "0.1.0",
+  "profile": "repository-development",
+  "description": "Build, test and inspect a repository; block secrets and unlisted network.",
+  "default_action": "deny",
+  "filesystem": {
+    "workspace": { "access": "read-write", "roots": ["~/repo"] },
+    "temp": { "access": "read-write" },
+    "sensitive_paths": ["~/.ssh", "~/.aws", "~/.config/gcloud", "~/.gnupg"]
+  },
+  "network": {
+    "default": "deny",
+    "allow": [
+      { "host": "registry.npmjs.org", "ports": [443] },
+      { "host": "*.crates.io", "ports": [443] },
+      { "host": "pypi.org", "ports": [443] }
+    ]
+  },
+  "process": {
+    "allow": [
+      { "executable": "git", "actions": ["status", "diff", "log", "add", "commit"] },
+      { "executable": "npm", "actions": ["install", "test", "run"] },
+      { "executable": "cargo", "actions": ["build", "test", "check"] }
+    ],
+    "require_approval": [
+      { "executable": "sudo" },
+      { "executable": "curl", "note": "arbitrary outbound transfer — needs approval" }
+    ],
+    "deny": [
+      { "executable": "rm", "actions": ["-rf", "-fr", "-rf"] }
+    ]
+  },
+  "secrets": {
+    "deny_env_keys": ["AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY", "GITHUB_TOKEN", "OPENAI_API_KEY"]
+  }
+}
