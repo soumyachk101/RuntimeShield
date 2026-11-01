@@ -327,6 +327,34 @@ func workspaceExecutions(w http.ResponseWriter, r *http.Request, s *Server) {
 	})
 }
 
+// deviceToken issues a short-lived device credential for an enrolled
+// device (spec §10 "short-lived device credentials"). The operator
+// requests it; the Rust agent would normally carry its own enrolled key,
+// but the console surfaces the flow for a device token lifecycle.
+func deviceToken(w http.ResponseWriter, r *http.Request, s *Server) {
+	dev := r.URL.Path[len("/v1/devices/"):]
+	dev = strings.TrimSuffix(dev, "/token")
+	if s.Issuer == nil {
+		httpError(w, http.StatusServiceUnavailable, "token issuer not configured")
+		return
+	}
+	tok, err := s.Issuer.Issue(auth.DeviceClaims{
+		DeviceID: dev,
+		OrgID:    r.URL.Query().Get("organization"),
+		Role:     "device",
+	})
+	if err != nil {
+		httpError(w, http.StatusInternalServerError, "issue token: "+err.Error())
+		return
+	}
+	writeJSON(w, map[string]string{
+		"status":   "issued",
+		"device":   dev,
+		"token":    tok,
+		"expires":  "24h",
+	})
+}
+
 func policiesList(w http.ResponseWriter, r *http.Request, s *Server) {
 	org := r.URL.Query().Get("organization")
 	items, err := s.Store.ListPolicies(r.Context(), org)
