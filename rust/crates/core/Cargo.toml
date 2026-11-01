@@ -1,0 +1,25 @@
+[package]
+name = "runtime-shield-core"
+description = "Deterministic policy engine for RuntimeShield: request validation, evaluation, path canonicalisation, network matching, secret redaction"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+
+[lib]
+name = "runtime_shield_core"
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+serde_yaml = { workspace = true }
+thiserror = { workspace = true }
+chrono = { workspace = true }
+uuid = { workspace = true }
+sha2 = { workspace = true }
+hex = { workspace = true }
+json_schema = { workspace = true }
+regex = "1"
+hmac = "0.12"
+
+[dev-dependencies]
+tempfile = { workspace = true }
