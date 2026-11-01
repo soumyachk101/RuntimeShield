@@ -1,0 +1,109 @@
+# RuntimeShield — single-host reference deployment.
+#
+# Bring-up:
+#   docker compose up -d --build
+#
+# Services (top of face):
+#   web        static console + nginx front, reverse-proxies /v1/ -> control plane
+#   controlplane Go control plane (built from controlplane/Dockerfile, postgres backend)
+#   postgres   PostgreSQL 16 (team metadata; migrations/001_init.sql target)
+#   nats       OPTIONAL, behind the `nats` profile (documented reference; the
+#              control plane's no-op spool fallback works without it)
+#
+# Build context for both app images is this file's directory (the product
+# root). The root .dockerignore is the one docker reads for those builds;
+# the per-directory .dockerignore files (controlplane/, web/) only apply if
+# someone builds with a sub-directory context (which can't build standalone).
+#
+# All app env var names below are taken verbatim from the control plane's
+# config package (controlplane/internal/config/config.go) and .env.example.
+# No variable is invented here.
+
+name: runshield
+
+services:
+  web:
+    build:
+      context: .
+      dockerfile: web/Dockerfile
+    image: runshield/web
+    container_name: runshield-web
+    depends_on:
+      - controlplane
+    ports:
+      - "8081:80"   # console UI; the control plane stays off public mapping
+    restart: unless-stopped
+    # No build-time env needed: the nginx front has the control-plane target
+    # (service name `controlplane`, port 8080) baked into deploy/nginx.conf.
+
+  controlplane:
+    build:
+      context: .
+      dockerfile: controlplane/Dockerfile
+    image: runshield/controlplane
+    container_name: runshield-controlplane
+    depends_on:
+      postgres:
+        condition: service_healthy
+    # --- storage backend (config: BackendPostgres + PGDSN required) ---
+    # Matches controlplane/.env.example shape (postgres://user:pass@host/db).
+    # Points at the compose `postgres` service host, not localhost.
+    environment:
+      RUNSHIELD_BACKEND: postgres
+      RUNSHIELD_PG_DSN: postgres://runshield:runshield@postgres:5432/runshield?sslmode=disable
+      # --- HTTP (config default :8080; the image ENV already sets this) ---
+      RUNSHIELD_HTTP_ADDR: ":8080"
+      RUNSHIELD_LOG_LEVEL: info
+      RUNSHIELD_RATE_LIMIT_RPS: "50"
+      RUNSHIELD_RATE_LIMIT_BURST: "100"
+      # --- key material: dev fallback is an ephemeral key (logged). For a
+      # real deploy, generate and inject these; they are mandatory in prod
+      # per config.go ("In production it is mandatory"). Omitted here so the
+      # stack boots with a warning rather than failing on a missing secret.
+      #   RUNSHIELD_SIGN_KEY: ${RUNSHIELD_SIGN_KEY}
+      #   RUNSHIELD_SESSION_KEY: ${RUNSHIELD_SESSION_KEY}
+      # --- NATS: only set when the `nats` profile is active (see below). ---
+      #RUNSHIELD_NATS_URL: nats://nats:4222
+    restart: unless-stopped
+    # Intentionally NOT mapped to a host port: the web front reverse-proxies
+    # /v1/ to this service on the compose network. Map it for direct testing:
+    #   ports:
+    #     - "8080:8080"
+
+  postgres:
+    image: postgres:16
+    container_name: runshield-postgres
+    environment:
+      # migrations/001_init.sql contains CREATE TABLE only — it does not
+      # create the role or database, so we provision them here. DB/user names
+      # follow the control plane's .env.example DSN convention (db "runshield").
+      POSTGRES_DB: runshield
+      POSTGRES_USER: runshield
+      POSTGRES_PASSWORD: runshield
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U runshield -d runshield"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    restart: unless-stopped
+    # Not port-mapped: reachable as `postgres` on the compose network only.
+
+  # --- OPTIONAL: NATS JetStream transport ----------------------------------
+  # Documented reference entry. The control plane's events pipeline (internal/events)
+  # only persists to the DB and falls back to the agent's file spool; it reads
+  # RUNSHIELD_NATS_URL but nothing in today's code publishes to NATS, so this
+  # service is a forward-looking reference, not a live dependency.
+  # Start with: docker compose --profile nats up -d
+  nats:
+    image: nats:latest
+    container_name: runshield-nats
+    profiles: [nats]
+    command: ["--jetstream"]
+    ports:
+      - "4222:4222"
+    restart: unless-stopped
+
+volumes:
+  postgres-data:
