@@ -333,14 +333,6 @@ func (s *dbStore) ListDecisions(ctx context.Context, limit int) ([]Decision, err
 	return out, rows.Err()
 }
 
-// rewrite is a small helper for QueryRowContext (which bypasses exec/query).
-func (s *dbStore) rewrite(q string) string {
-	if s.kind != "postgres" {
-		return q
-	}
-	return rewritePlaceholders(q)
-}
-
 func (s *dbStore) InsertEvent(ctx context.Context, e ExecEvent) error {
 	q := `INSERT INTO execution_events (id, request_id, event_type, metadata_redacted, sequence)
 		VALUES (?, ?, ?, ?, ?) ON CONFLICT (id) DO NOTHING`
