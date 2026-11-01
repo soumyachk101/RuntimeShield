@@ -18,6 +18,7 @@ import (
 	"strconv"
 	"time"
 
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/stdlib"
 	_ "modernc.org/sqlite"
 )
@@ -82,8 +83,15 @@ func NewStore(backend, dsn, sqlitePath string) (Store, error) {
 			db.SetMaxOpenConns(1) // single writer
 		}
 	case "postgres":
-		db, err = stdlib.OpenDB(dsn)
+		// pgx stdlib.OpenDB is lazy: it takes a ConnConfig and returns a
+		// single *sql.DB; connection problems surface on the first Ping.
+		cfg, cerr := pgx.ParseConfig(dsn)
+		if cerr != nil {
+			return nil, fmt.Errorf("parse postgres DSN: %w", cerr)
+		}
+		db = stdlib.OpenDB(*cfg)
 		kind = "postgres"
+		err = nil
 	default:
 		return nil, fmt.Errorf("unknown backend %q (want sqlite|postgres)", backend)
 	}
