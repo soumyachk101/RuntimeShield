@@ -1,0 +1,25 @@
+{
+  "request_id": "demo-0001",
+  "executable": "git",
+  "argv": [
+    "git",
+    "status",
+    "--porcelain"
+  ],
+  "cwd": "~/repo",
+  "workspace": "repo-w1",
+  "capabilities": [
+    {
+      "kind": "process",
+      "executable": "git"
+    },
+    {
+      "kind": "fs_read",
+      "path": "."
+    }
+  ],
+  "env_keys_requested": [],
+  "principal_id": "claude-code",
+  "principal": "agent",
+  "principal_display": "Claude Code"
+}
