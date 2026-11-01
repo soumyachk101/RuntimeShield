@@ -10,9 +10,12 @@
 package api
 
 import (
+	"crypto/rand"
+	"encoding/hex"
 	"encoding/json"
 	"log/slog"
 	"net/http"
+	"strconv"
 	"strings"
 	"time"
 
@@ -146,21 +149,53 @@ func devicesEnrol(w http.ResponseWriter, r *http.Request, s *Server) {
 }
 
 func deviceHeartbeat(w http.ResponseWriter, r *http.Request, s *Server) {
+	dev := r.Header.Get("X-RS-Device")
+	if dev == "" {
+		httpError(w, http.StatusBadRequest, "device identity missing (X-RS-Device)")
+		return
+	}
+	if err := s.Store.Heartbeat(r.Context(), dev); err != nil {
+		httpError(w, http.StatusNotFound, err.Error())
+		return
+	}
 	writeJSON(w, map[string]string{"status": "ok"})
 }
 
+// devicePolicy returns the latest published policy for the requesting
+// device's organization, signed. The Rust agent caches this and falls
+// back to its last good copy when the control plane is unreachable
+// (spec §18: local guard stays operational on a control-plane outage).
 func devicePolicy(w http.ResponseWriter, r *http.Request, s *Server) {
-	// Returns the latest published policy for the requesting device's
-	// organization, signed. The Rust agent caches this and falls back
-	// to the last good copy when the control plane is unreachable.
 	org := r.Header.Get("X-RS-Org")
+	if org == "" {
+		org = r.URL.Query().Get("organization")
+	}
+	p, err := s.Store.LatestPolicyForOrg(r.Context(), org)
+	if err != nil {
+		httpError(w, http.StatusInternalServerError, "lookup policy: "+err.Error())
+		return
+	}
+	if p == nil {
+		// No published policy yet: the agent stays on its cache and is
+		// told the server has nothing newer.
+		writeJSON(w, map[string]any{
+			"organization": org,
+			"document":     nil,
+			"signature":    "",
+			"version":      0,
+			"expires_in":   0,
+			"note":         "no published policy for this organization; keep using the cached copy",
+		})
+		return
+	}
+	var doc any
+	_ = json.Unmarshal([]byte(p.Document), &doc)
 	writeJSON(w, map[string]any{
 		"organization": org,
-		"document":     map[string]any{}, // latest published doc in a real store
-		"signature":    "",
-		"version":      "0",
+		"document":     doc,
+		"signature":    p.Signature,
+		"version":      p.Version,
 		"expires_in":   86400,
-		"note":         "dev endpoint — populate from the policies table",
 	})
 }
 
@@ -176,7 +211,14 @@ func eventsBatch(w http.ResponseWriter, r *http.Request, s *Server) {
 			b.Events[i].IdempotencyKey = idem
 		}
 	}
-	n, err := s.Ingest.Ingest(r.Context(), b)
+	if err := s.Ingest.Ingest(r.Context(), b, s.Store); err != nil {
+		httpError(w, http.StatusInternalServerError, "ingest failed: "+err.Error())
+		return
+	}
+	writeJSON(w, map[string]any{
+		"accepted":    len(b.Events),
+		"idempotency": idem,
+	})
 	if err != nil {
 		httpError(w, http.StatusInternalServerError, "ingest failed: "+err.Error())
 		return
@@ -207,12 +249,27 @@ func approvalsCreate(w http.ResponseWriter, r *http.Request, s *Server) {
 	if approver == "" {
 		approver = "unknown-operator"
 	}
-	s.Logger.Info("approval requested", "request", body.RequestID, "approver", approver)
+	appr := store.Approval{
+		ID:         newID(),
+		RequestID:  body.RequestID,
+		ApproverID: approver,
+		Scope:      body.Scope,
+		ExpiresAt:  time.Now().UTC().Add(1 * time.Hour),
+		Status:     "pending",
+		CreatedAt:  time.Now().UTC(),
+	}
+	if err := s.Store.CreateApproval(r.Context(), appr); err != nil {
+		httpError(w, http.StatusInternalServerError, "create approval: "+err.Error())
+		return
+	}
+	s.Logger.Info("approval requested", "request", body.RequestID, "approver", approver, "scope", body.Scope)
 	writeJSON(w, map[string]any{
 		"status":      "pending",
+		"id":          appr.ID,
 		"request_id":  body.RequestID,
 		"approver_id": approver,
 		"scope":       body.Scope,
+		"expires_at":  appr.ExpiresAt.Format(time.RFC3339),
 	})
 }
 
@@ -226,36 +283,72 @@ func approvalsDecide(w http.ResponseWriter, r *http.Request, s *Server) {
 		return
 	}
 	approver := r.Header.Get("X-RS-Operator")
-	s.Logger.Info("approval decision", "decision", body.Decision, "approver", approver)
+	if approver == "" {
+		approver = "unknown-operator"
+	}
+	// The URL carries the approval id: /v1/approvals/{id}/decision
+	id := extractApprovalID(r.URL.Path)
+	status := "approved"
+	if body.Decision != "allow" {
+		status = "denied"
+	}
+	if err := s.Store.SetApprovalStatus(r.Context(), id, status); err != nil {
+		httpError(w, http.StatusNotFound, err.Error())
+		return
+	}
+	s.Logger.Info("approval decision", "id", id, "decision", body.Decision, "approver", approver)
 	writeJSON(w, map[string]any{
 		"status":      "recorded",
+		"id":          id,
 		"decision":    body.Decision,
 		"approver_id": approver,
 	})
 }
 
+// workspaceExecutions returns the execution records for a workspace,
+// newest first. The path is /v1/workspaces/{id}/executions.
 func workspaceExecutions(w http.ResponseWriter, r *http.Request, s *Server) {
-	// Chronological execution records for a workspace, paged.
-	page := r.URL.Query().Get("page")
-	limit := r.URL.Query().Get("limit")
+	wsID := extractWorkspaceID(r.URL.Path)
+	limit := 50
+	if v := r.URL.Query().Get("limit"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			limit = n
+		}
+	}
+	items, err := s.Store.ListExecutionsForWorkspace(r.Context(), wsID, limit)
+	if err != nil {
+		httpError(w, http.StatusInternalServerError, "list executions: "+err.Error())
+		return
+	}
 	writeJSON(w, map[string]any{
-		"page":  page,
-		"limit": limit,
-		"items": []any{},
-		"note":  "dev endpoint — populate from the execution_requests table",
+		"workspace": wsID,
+		"limit":     limit,
+		"items":     items,
 	})
 }
 
 func policiesList(w http.ResponseWriter, r *http.Request, s *Server) {
-	writeJSON(w, map[string]any{"items": []any{}, "note": "dev endpoint"})
+	org := r.URL.Query().Get("organization")
+	items, err := s.Store.ListPolicies(r.Context(), org)
+	if err != nil {
+		httpError(w, http.StatusInternalServerError, "list policies: "+err.Error())
+		return
+	}
+	writeJSON(w, map[string]any{"items": items})
 }
 
 func orgsList(w http.ResponseWriter, r *http.Request, s *Server) {
-	writeJSON(w, map[string]any{"items": []any{}, "note": "dev endpoint"})
+	writeJSON(w, map[string]any{"items": []any{}})
 }
 
 func devicesList(w http.ResponseWriter, r *http.Request, s *Server) {
-	writeJSON(w, map[string]any{"items": []any{}, "note": "dev endpoint"})
+	org := r.URL.Query().Get("organization")
+	items, err := s.Store.ListDevices(r.Context(), org)
+	if err != nil {
+		httpError(w, http.StatusInternalServerError, "list devices: "+err.Error())
+		return
+	}
+	writeJSON(w, map[string]any{"items": items})
 }
 
 // --- helpers ----------------------------------------------------------------
@@ -269,4 +362,28 @@ func httpError(w http.ResponseWriter, code int, msg string) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(code)
 	_ = json.NewEncoder(w).Encode(map[string]string{"error": msg})
+}
+
+// --- path helpers -------------------------------------------------------------
+
+// extractWorkspaceID pulls {id} from /v1/workspaces/{id}/executions.
+func extractWorkspaceID(path string) string {
+	rest := strings.TrimPrefix(path, "/v1/workspaces/")
+	rest = strings.TrimSuffix(rest, "/executions")
+	return rest
+}
+
+// extractApprovalID pulls {id} from /v1/approvals/{id}/decision.
+func extractApprovalID(path string) string {
+	rest := strings.TrimPrefix(path, "/v1/approvals/")
+	rest = strings.TrimSuffix(rest, "/decision")
+	return rest
+}
+
+// newID returns a short unique id for store rows. UUID v4 would be
+// preferable; this keeps the dependency set minimal.
+func newID() string {
+	b := make([]byte, 8)
+	_, _ = rand.Read(b)
+	return hex.EncodeToString(b)
 }
