@@ -24,6 +24,7 @@ import (
 
 // Store is the backend-agnostic interface.
 type Store interface {
+	// Ping, lifecycle, backend
 	Ping() error
 	// ApplySchema creates the tables if missing (idempotent). The
 	// canonical DDL for Postgres is migrations/001_init.sql; the
@@ -31,6 +32,9 @@ type Store interface {
 	ApplySchema() error
 	Close() error
 	Backend() string
+	// DB exposes the underlying *sql.DB for callers that need raw
+	// queries (e.g. tests).
+	DB() *sql.DB
 
 	// Repositories
 	UpsertOrg(ctx context.Context, o Org) error
@@ -84,6 +88,7 @@ type dbStore struct {
 func (s *dbStore) Ping() error     { return s.db.Ping() }
 func (s *dbStore) Close() error    { return s.db.Close() }
 func (s *dbStore) Backend() string { return s.kind }
+func (s *dbStore) DB() *sql.DB     { return s.db }
 
 func (s *dbStore) ApplySchema() error {
 	script := `
@@ -130,13 +135,11 @@ CREATE TABLE IF NOT EXISTS execution_events (
 
 // --- dialect helpers ---------------------------------------------------------
 
-// rewrite turns `?` placeholders into `$n` on Postgres. It is a
-// token scan, not a SQL parser; every query in this package uses `?`
-// only in value position, which is the guarantee that makes this safe.
-func (s *dbStore) rewrite(q string) string {
-	if s.kind != "postgres" {
-		return q
-	}
+// rewritePlaceholders turns `?` value placeholders into Postgres `$n`.
+// It is a token scan, not a SQL parser; every query in this package uses
+// `?` only in value position, which is the guarantee that makes this safe.
+// SQLite keeps `?`, so callers return the input unchanged there.
+func rewritePlaceholders(q string) string {
 	var out []byte
 	n := 0
 	for i := 0; i < len(q); i++ {
@@ -149,6 +152,14 @@ func (s *dbStore) rewrite(q string) string {
 		}
 	}
 	return string(out)
+}
+
+// rewrite applies the dialect-specific placeholder form for this store.
+func (s *dbStore) rewrite(q string) string {
+	if s.kind != "postgres" {
+		return q
+	}
+	return rewritePlaceholders(q)
 }
 
 // nowRFC3339 keeps timestamp handling consistent across backends.
