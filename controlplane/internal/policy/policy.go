@@ -21,8 +21,9 @@ import (
 
 // Service validates, signs and stores policies.
 type Service struct {
-	compiler *jsonschema.Compiler
-	signKey  []byte
+	compiler  *jsonschema.Compiler
+	signKey   []byte
+	rawSchema []byte
 }
 
 // NewService builds a policy service. signKey may be nil (dev mode),
@@ -44,8 +45,13 @@ func NewService(schemaPath string, signKey []byte) (*Service, error) {
 	if err != nil {
 		return nil, fmt.Errorf("compile schema: %w", err)
 	}
-	return &Service{compiler: compiler, signKey: signKey}, s
+	return &Service{compiler: compiler, signKey: signKey, rawSchema: raw}, s
 }
+
+// Schema returns the raw policy JSON schema the service validates
+// against, so the web editor can validate locally against the same
+// source of truth the control plane uses.
+func (s *Service) Schema() []byte { return s.rawSchema }
 
 // Validate checks a policy document against the schema, returning the
 // list of validation errors (empty = valid).
