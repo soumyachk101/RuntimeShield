@@ -379,6 +379,194 @@ func devicesList(w http.ResponseWriter, r *http.Request, s *Server) {
 	writeJSON(w, map[string]any{"items": items})
 }
 
+// --- policies dispatch --------------------------------------------------------
+//
+// /v1/policies routes:
+//   GET  /v1/policies?organization=   -> list versions
+//   GET  /v1/policies/schema          -> the JSON schema (for the web editor)
+//   GET  /v1/policies/{id}            -> one policy document
+//   POST /v1/policies                 -> create a draft (validated + signed)
+//   POST /v1/policies/{id}/publish    -> publish
+//   POST /v1/policies/{id}/rollback   -> roll back to a prior version
+
+func policiesDispatch(w http.ResponseWriter, r *http.Request, s *Server) {
+	path := r.URL.Path
+	switch {
+	case path == "/v1/policies/schema" && r.Method == http.MethodGet:
+		policySchema(w, r, s)
+	case path == "/v1/policies" && r.Method == http.MethodPost:
+		policiesCreate(w, r, s)
+	case strings.HasSuffix(path, "/publish") && r.Method == http.MethodPost:
+		policiesPublish(w, r, s)
+	case strings.HasSuffix(path, "/rollback") && r.Method == http.MethodPost:
+		policiesRollback(w, r, s)
+	case strings.HasPrefix(path, "/v1/policies/") && r.Method == http.MethodGet:
+		policiesGet(w, r, s)
+	case r.Method == http.MethodGet:
+		policiesList(w, r, s)
+	default:
+		httpError(w, http.StatusMethodNotAllowed, "method not allowed")
+	}
+}
+
+// policySchema returns the raw policy JSON schema the control plane validates
+// against, so the web editor validates locally against the same source of
+// truth (spec §5 "single source of truth").
+func policySchema(w http.ResponseWriter, r *http.Request, s *Server) {
+	w.Header().Set("Content-Type", "application/schema+json")
+	_, _ = w.Write(s.Policy.Schema())
+}
+
+// policiesGet returns one policy by id: /v1/policies/{id}.
+func policiesGet(w http.ResponseWriter, r *http.Request, s *Server) {
+	id := strings.TrimPrefix(r.URL.Path, "/v1/policies/")
+	p, err := s.Store.GetPolicy(r.Context(), id)
+	if err != nil {
+		httpError(w, http.StatusInternalServerError, "lookup policy: "+err.Error())
+		return
+	}
+	if p == nil {
+		httpError(w, http.StatusNotFound, "policy not found")
+		return
+	}
+	var parsed any
+	_ = json.Unmarshal([]byte(p.Document), &parsed)
+	writeJSON(w, map[string]any{"policy": p, "document": parsed})
+}
+
+// policiesCreate validates a draft policy document against the schema, signs
+// it and stores a new versioned row (spec §10 POST /v1/policies). The
+// document body is the policy document itself.
+func policiesCreate(w http.ResponseWriter, r *http.Request, s *Server) {
+	var body struct {
+		Organization string          `json:"organization"`
+		Document     json.RawMessage `json:"document"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		httpError(w, http.StatusBadRequest, "invalid JSON: "+err.Error())
+		return
+	}
+	if body.Organization == "" || len(body.Document) == 0 {
+		httpError(w, http.StatusBadRequest, "organization and document are required")
+		return
+	}
+	if errs := s.Policy.Validate(body.Document); len(errs) > 0 {
+		httpError(w, http.StatusUnprocessableEntity, "policy failed schema validation: "+strings.Join(errs, "; "))
+		return
+	}
+	version, err := s.Store.NextPolicyVersion(r.Context(), body.Organization)
+	if err != nil {
+		httpError(w, http.StatusInternalServerError, "next version: "+err.Error())
+		return
+	}
+	p := store.Policy{
+		ID:        newID(),
+		OrgID:     body.Organization,
+		Version:   version,
+		Document:  string(body.Document),
+		Signature: s.Policy.Sign(body.Document),
+		Status:    "draft",
+		CreatedAt: time.Now().UTC(),
+	}
+	if err := s.Store.CreatePolicy(r.Context(), p); err != nil {
+		httpError(w, http.StatusInternalServerError, "create policy: "+err.Error())
+		return
+	}
+	s.Logger.Info("policy draft created", "org", body.Organization, "version", version)
+	writeJSON(w, map[string]any{"status": "created", "id": p.ID, "version": version, "status_out": p.Status})
+}
+
+// policiesPublish marks a policy published: /v1/policies/{id}/publish.
+func policiesPublish(w http.ResponseWriter, r *http.Request, s *Server) {
+	id := strings.TrimSuffix(strings.TrimPrefix(r.URL.Path, "/v1/policies/"), "/publish")
+	if err := s.Store.SetPolicyStatus(r.Context(), id, "published"); err != nil {
+		httpError(w, http.StatusNotFound, err.Error())
+		return
+	}
+	s.Logger.Info("policy published", "id", id)
+	writeJSON(w, map[string]string{"status": "published", "id": id})
+}
+
+// policiesRollback marks a policy rolled back: /v1/policies/{id}/rollback.
+func policiesRollback(w http.ResponseWriter, r *http.Request, s *Server) {
+	id := strings.TrimSuffix(strings.TrimPrefix(r.URL.Path, "/v1/policies/"), "/rollback")
+	if err := s.Store.SetPolicyStatus(r.Context(), id, "rolled_back"); err != nil {
+		httpError(w, http.StatusNotFound, err.Error())
+		return
+	}
+	s.Logger.Info("policy rolled back", "id", id)
+	writeJSON(w, map[string]string{"status": "rolled_back", "id": id})
+}
+
+// --- users / decisions / approvals -------------------------------------------
+
+// usersList returns the members of an organisation: GET /v1/users?organization=.
+func usersList(w http.ResponseWriter, r *http.Request, s *Server) {
+	org := r.URL.Query().Get("organization")
+	items, err := s.Store.ListUsers(r.Context(), org)
+	if err != nil {
+		httpError(w, http.StatusInternalServerError, "list users: "+err.Error())
+		return
+	}
+	writeJSON(w, map[string]any{"items": items})
+}
+
+// decisionsList returns the audit timeline: GET /v1/decisions with optional
+// device_id, policy_version and decision filters. Rule IDs and the decision
+// are surfaced so the console can show the exact rule that denied a request
+// (spec §12 "Audit explorer").
+func decisionsList(w http.ResponseWriter, r *http.Request, s *Server) {
+	q := r.URL.Query()
+	limit := 200
+	if v := q.Get("limit"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			limit = n
+		}
+	}
+	f := store.DecisionFilter{
+		DeviceID:      q.Get("device_id"),
+		PolicyVersion: q.Get("policy_version"),
+		Decision:      q.Get("decision"),
+		Limit:         limit,
+	}
+	items, err := s.Store.ListDecisionsFiltered(r.Context(), f)
+	if err != nil {
+		httpError(w, http.StatusInternalServerError, "list decisions: "+err.Error())
+		return
+	}
+	writeJSON(w, map[string]any{"items": items, "limit": limit})
+}
+
+// approvalsDispatch routes /v1/approvals:
+//   GET  /v1/approvals?status=     -> list (pending | approved | denied | "" all)
+//   POST /v1/approvals            -> create a pending approval
+//   POST /v1/approvals/{id}/decision -> approve/deny
+
+func approvalsDispatch(w http.ResponseWriter, r *http.Request, s *Server) {
+	switch {
+	case strings.HasSuffix(r.URL.Path, "/decision") && r.Method == http.MethodPost:
+		approvalsDecide(w, r, s)
+	case r.Method == http.MethodPost:
+		approvalsCreate(w, r, s)
+	case r.Method == http.MethodGet:
+		approvalsList(w, r, s)
+	default:
+		httpError(w, http.StatusMethodNotAllowed, "method not allowed")
+	}
+}
+
+// approvalsList returns approvals by status for the approval workspace's
+// decision history: GET /v1/approvals?status=pending|approved|denied|"".
+func approvalsList(w http.ResponseWriter, r *http.Request, s *Server) {
+	status := r.URL.Query().Get("status")
+	items, err := s.Store.ListApprovals(r.Context(), status)
+	if err != nil {
+		httpError(w, http.StatusInternalServerError, "list approvals: "+err.Error())
+		return
+	}
+	writeJSON(w, map[string]any{"items": items, "status": status})
+}
+
 // --- helpers ----------------------------------------------------------------
 
 func writeJSON(w http.ResponseWriter, v any) {
