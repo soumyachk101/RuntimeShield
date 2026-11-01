@@ -14,7 +14,7 @@ import (
 
 // Environment variable names used by the control plane.
 const (
-	EnvBackend        = "RUNSHIELD_BACKEND"   // "postgres" | "sqlite"
+	EnvBackend        = "RUNSHIELD_BACKEND" // "postgres" | "sqlite"
 	EnvPGDSN          = "RUNSHIELD_PG_DSN"
 	EnvSQLitePath     = "RUNSHIELD_SQLITE_PATH"
 	EnvHTTPAddr       = "RUNSHIELD_HTTP_ADDR"
@@ -38,18 +38,18 @@ const (
 
 // Config is the resolved, validated configuration.
 type Config struct {
-	Backend     BackendKind
-	PGDSN       string
-	SQLitePath  string
-	HTTPAddr    string
-	TLSCert     string
-	TLSKey      string
-	SignKey     []byte
-	SessionKey  []byte
-	RateLimitRPS int
+	Backend        BackendKind
+	PGDSN          string
+	SQLitePath     string
+	HTTPAddr       string
+	TLSCert        string
+	TLSKey         string
+	SignKey        []byte
+	SessionKey     []byte
+	RateLimitRPS   int
 	RateLimitBurst int
-	LogLevel    string
-	NATSURL     string // optional; empty disables NATS transport
+	LogLevel       string
+	NATSURL        string // optional; empty disables NATS transport
 }
 
 // FromEnv reads the environment, applying defaults, and returns an error
