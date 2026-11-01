@@ -211,22 +211,16 @@ func eventsBatch(w http.ResponseWriter, r *http.Request, s *Server) {
 			b.Events[i].IdempotencyKey = idem
 		}
 	}
+	// Ingest persists the batch and dedupes on the idempotency key; it
+	// returns only an error (the new-events count is no longer surfaced),
+	// so the handler reports the number accepted, not the deduped count.
 	if err := s.Ingest.Ingest(r.Context(), b, s.Store); err != nil {
 		httpError(w, http.StatusInternalServerError, "ingest failed: "+err.Error())
 		return
 	}
+	s.Logger.Info("events batch", "received", len(b.Events), "idempotency", idem)
 	writeJSON(w, map[string]any{
 		"accepted":    len(b.Events),
-		"idempotency": idem,
-	})
-	if err != nil {
-		httpError(w, http.StatusInternalServerError, "ingest failed: "+err.Error())
-		return
-	}
-	s.Logger.Info("events batch", "received", len(b.Events), "new", n, "idempotency", idem)
-	writeJSON(w, map[string]any{
-		"accepted":    len(b.Events),
-		"deduped":     len(b.Events) - n,
 		"idempotency": idem,
 	})
 }
