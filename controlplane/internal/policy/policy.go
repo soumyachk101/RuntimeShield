@@ -8,7 +8,6 @@
 package policy
 
 import (
-	"bytes"
 	"crypto/hmac"
 	"crypto/sha256"
 	"encoding/hex"
@@ -66,16 +65,14 @@ func (s *Service) Validate(doc json.RawMessage) []string {
 		}
 		s.schema = compiled
 	}
-	err := compiled.Validate(bytes.NewReader(doc))
-	if err == nil {
-		return nil
+	var parsed any
+	if err := json.Unmarshal(doc, &parsed); err != nil {
+		return []string{fmt.Sprintf("policy document is not valid JSON: %v", err)}
 	}
-	// Flatten the validation error text so the API can surface it.
-	out := []string{err.Error()}
-	if e, ok := err.(*jsonschema.ValidationError); ok && e.Err != nil {
-		out = []string{e.Err.Error()}
+	if err := compiled.Validate(parsed); err != nil {
+		return []string{err.Error()}
 	}
-	return out
+	return nil
 }
 
 // Sign produces an HMAC-SHA256 signature over the canonical document.
