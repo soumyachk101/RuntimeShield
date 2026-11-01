@@ -47,6 +47,7 @@ type Store interface {
 	SetPolicyStatus(ctx context.Context, id, status string) error
 	LatestPolicyForOrg(ctx context.Context, org string) (*Policy, error)
 	ListPolicies(ctx context.Context, org string) ([]Policy, error)
+	GetPolicy(ctx context.Context, id string) (*Policy, error)
 	CreateApproval(ctx context.Context, a Approval) error
 	SetApprovalStatus(ctx context.Context, id, status string) error
 	PendingApprovals(ctx context.Context) ([]Approval, error)
@@ -55,7 +56,7 @@ type Store interface {
 	ListExecutionsForWorkspace(ctx context.Context, workspace string, limit int) ([]ExecutionRequest, error)
 	InsertDecision(ctx context.Context, d Decision) error
 	ListDecisions(ctx context.Context, limit int) ([]Decision, error)
-	ListDecisionsFiltered(ctx context.Context, f DecisionFilter) ([]Decision, error)
+	ListDecisionsFiltered(ctx context.Context, f DecisionFilter) ([]DecisionRow, error)
 	InsertEvent(ctx context.Context, e ExecEvent) error
 }
 
