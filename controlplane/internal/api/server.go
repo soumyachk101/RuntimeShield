@@ -85,18 +85,23 @@ func (s *Server) Routes(mux *http.ServeMux) {
 	// Rust agent records local approvals in its own journal, so the
 	// control-plane approval endpoints serve the team console, not the
 	// device.
-	mux.Handle("/v1/policies", operatorRoute(s, http.HandlerFunc(policiesDispatch)))
-	mux.Handle("/v1/policies/", operatorRoute(s, http.HandlerFunc(policiesDispatch)))
-	mux.Handle("/v1/organizations", operatorRoute(s, http.HandlerFunc(orgsList)))
-	mux.Handle("/v1/users", operatorRoute(s, http.HandlerFunc(usersList)))
-	mux.Handle("/v1/devices", operatorRoute(s, http.HandlerFunc(devicesList)))
-	mux.Handle("/v1/decisions", operatorRoute(s, http.HandlerFunc(decisionsList)))
-	mux.Handle("/v1/approvals", operatorRoute(s, http.HandlerFunc(approvalsDispatch)))
-	mux.Handle("/v1/approvals/", operatorRoute(s, http.HandlerFunc(approvalsDispatch)))
+	// Wrap a 3-param handler (w, r, s) into an http.Handler that
+	// carries the server via closure.
+	wrap := func(h func(w http.ResponseWriter, r *http.Request, s *Server)) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { h(w, r, s) })
+	}
+	mux.Handle("/v1/policies", operatorRoute(s, wrap(policiesDispatch)))
+	mux.Handle("/v1/policies/", operatorRoute(s, wrap(policiesDispatch)))
+	mux.Handle("/v1/organizations", operatorRoute(s, wrap(orgsList)))
+	mux.Handle("/v1/users", operatorRoute(s, wrap(usersList)))
+	mux.Handle("/v1/devices", operatorRoute(s, wrap(devicesList)))
+	mux.Handle("/v1/decisions", operatorRoute(s, wrap(decisionsList)))
+	mux.Handle("/v1/approvals", operatorRoute(s, wrap(approvalsDispatch)))
+	mux.Handle("/v1/approvals/", operatorRoute(s, wrap(approvalsDispatch)))
 }
 
 // operatorRoute requires a valid session cookie or operator bearer.
-func operatorRoute(s *Server, next http.HandlerFunc) http.Handler {
+func operatorRoute(s *Server, next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		// Operator sessions in this reference implementation are
 		// token-bearer (X-RS-Operator) issued by the auth package; a
@@ -105,7 +110,7 @@ func operatorRoute(s *Server, next http.HandlerFunc) http.Handler {
 			httpError(w, http.StatusUnauthorized, "operator identity required")
 			return
 		}
-		next(w, r)
+		next.ServeHTTP(w, r)
 	})
 }
 
