@@ -1,0 +1,13 @@
+{
+  "version": 1,
+  "policy_version": "0.1.0",
+  "profile": "inspect-only",
+  "description": "Observation profile: nothing is blocked, everything is recorded (audit_only).",
+  "default_action": "audit_only",
+  "filesystem": {
+    "workspace": { "access": "read-only", "roots": ["~/repo"] }
+  },
+  "network": { "default": "allow" },
+  "process": {},
+  "secrets": { "deny_env_keys": ["AWS_SECRET_ACCESS_KEY"] }
+}
