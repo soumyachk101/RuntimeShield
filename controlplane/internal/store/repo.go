@@ -231,6 +231,24 @@ func (s *dbStore) SetPolicyStatus(ctx context.Context, id, status string) error 
 	return nil
 }
 
+// GetPolicy returns a single policy by id, or nil if not found.
+func (s *dbStore) GetPolicy(ctx context.Context, id string) (*Policy, error) {
+	q := `SELECT id, organization_id, version, document, signature, status, created_at
+		FROM policies WHERE id = ?`
+	row := s.db.QueryRowContext(ctx, s.rewrite(q), id)
+	var p Policy
+	var doc, sig, created string
+	if err := row.Scan(&p.ID, &p.OrgID, &p.Version, &doc, &sig, &p.Status, &created); err != nil {
+		if err == sql.ErrNoRows {
+			return nil, nil
+		}
+		return nil, err
+	}
+	p.Document, p.Signature = doc, sig
+	p.CreatedAt, _ = time.Parse(time.RFC3339, created)
+	return &p, nil
+}
+
 // LatestPolicyForOrg returns the most recent published policy for the
 // organization, or nil if none exists.
 func (s *dbStore) LatestPolicyForOrg(ctx context.Context, org string) (*Policy, error) {
