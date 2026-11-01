@@ -73,7 +73,7 @@ func main() {
 		os.Exit(1)
 	}
 
-	ingest := events.NewIngestor(st.DB(), st.Backend())
+	ingest := events.NewIngestor(0)
 
 	// Token issuer. If no signing key is configured, fall back to a
 	// random ephemeral key so the auth path still works in dev, and
