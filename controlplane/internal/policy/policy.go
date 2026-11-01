@@ -22,6 +22,7 @@ import (
 // Service validates, signs and stores policies.
 type Service struct {
 	compiler  *jsonschema.Compiler
+	schema    *jsonschema.Schema
 	signKey   []byte
 	rawSchema []byte
 }
@@ -45,7 +46,7 @@ func NewService(schemaPath string, signKey []byte) (*Service, error) {
 	if err != nil {
 		return nil, fmt.Errorf("compile schema: %w", err)
 	}
-	return &Service{compiler: compiler, signKey: signKey, rawSchema: raw}, s
+	return &Service{compiler: compiler, signKey: signKey, rawSchema: raw, schema: s}, nil
 }
 
 // Schema returns the raw policy JSON schema the service validates
@@ -56,24 +57,23 @@ func (s *Service) Schema() []byte { return s.rawSchema }
 // Validate checks a policy document against the schema, returning the
 // list of validation errors (empty = valid).
 func (s *Service) Validate(doc json.RawMessage) []string {
-	schema, err := s.compiler.Compile("urn:runshield:policy")
-	if err != nil {
-		return []string{fmt.Sprintf("schema compile: %v", err)}
+	compiled := s.schema
+	if compiled == nil {
+		var err error
+		compiled, err = s.compiler.Compile("urn:runshield:policy")
+		if err != nil {
+			return []string{fmt.Sprintf("schema compile: %v", err)}
+		}
+		s.schema = compiled
 	}
-	res := schema.Validate(bytes.NewReader(doc))
-	if res == nil {
+	err := compiled.Validate(bytes.NewReader(doc))
+	if err == nil {
 		return nil
 	}
-	outs := res.Output
-	var out []string
-	for _, u := range outs {
-		if u.Type != "error" {
-			continue
-		}
-		out = append(out, u.InstancePtr)
-	}
-	if out == nil {
-		out = []string{"document does not match policy JSON schema"}
+	// Flatten the validation error text so the API can surface it.
+	out := []string{err.Error()}
+	if e, ok := err.(*jsonschema.ValidationError); ok && e.Err != nil {
+		out = []string{e.Err.Error()}
 	}
 	return out
 }
