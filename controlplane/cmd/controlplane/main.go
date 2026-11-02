@@ -133,14 +133,12 @@ func main() {
 
 	// Production server hygiene: bound header sizes + idle connections
 	// so slowloris / header-flood cannot tie up the listener.
-	httpTimeouts := func() func(*http.Server) {
-		return func(srv *http.Server) {
-			srv.ReadHeaderTimeout = 10 * time.Second
-			srv.ReadTimeout = 30 * time.Second
-			srv.WriteTimeout = 30 * time.Second
-			srv.IdleTimeout = 2 * time.Minute
-			srv.MaxHeaderBytes = 1 << 20
-		}
+	applyTimeouts := func(srv *http.Server) {
+		srv.ReadHeaderTimeout = 10 * time.Second
+		srv.ReadTimeout = 30 * time.Second
+		srv.WriteTimeout = 30 * time.Second
+		srv.IdleTimeout = 2 * time.Minute
+		srv.MaxHeaderBytes = 1 << 20
 	}
 
 	var srv *http.Server
@@ -149,7 +147,7 @@ func main() {
 			Addr:    cfg.HTTPAddr,
 			Handler: mux,
 		}
-		httpTimeouts()(srv)
+		applyTimeouts(srv)
 		go func() {
 			logger.Info("control plane listening (TLS)", "addr", cfg.HTTPAddr)
 			if err := srv.ListenAndServeTLS(cfg.TLSCert, cfg.TLSKey); err != nil && !errors.Is(err, http.ErrServerClosed) {
@@ -161,7 +159,7 @@ func main() {
 			Addr:    cfg.HTTPAddr,
 			Handler: mux,
 		}
-		httpTimeouts()(srv)
+		applyTimeouts(srv)
 		go func() {
 			logger.Info("control plane listening", "addr", cfg.HTTPAddr, "tls", false, "devMode", devMode)
 			if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
