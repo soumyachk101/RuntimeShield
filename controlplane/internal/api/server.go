@@ -769,11 +769,18 @@ func (s *Server) handleApprovalsList(w http.ResponseWriter, r *http.Request) {
 
 // --- hardening wrapper (headers + CORS + dev marker) -------------------------
 
-// harden applies security headers, CORS and the dev-mode marker to every
-// response, including 404s that the inner mux would otherwise serve.
+// harden applies the security-header baseline, CORS and the dev-mode
+// marker to every response, including 404s that the inner mux would
+// otherwise serve. The API serves only JSON, so the CSP is a strict
+// default-deny: nothing the browser renders from these responses may load
+// or frame anything.
 func (s *Server) harden(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("X-Content-Type-Options", "nosniff")
+		w.Header().Set("X-Frame-Options", "DENY")
+		w.Header().Set("Referrer-Policy", "strict-origin-when-cross-origin")
+		w.Header().Set("Content-Security-Policy", "default-src 'none'; frame-ancestors 'none'; base-uri 'none'")
+		w.Header().Set("Permissions-Policy", "camera=(), microphone=(), geolocation=()")
 		w.Header().Set("Cache-Control", "no-store")
 		if s.DevMode {
 			w.Header().Set("X-RS-Dev-Mode", "true")
@@ -787,10 +794,12 @@ func (s *Server) harden(next http.Handler) http.Handler {
 	})
 }
 
-// applyCORS keeps `*` only in dev mode; config-driven otherwise.
+// applyCORS keeps `*` only in dev mode; keyed (production) mode is
+// config-driven: a request is answered only when its Origin is in the
+// allowlist, otherwise no Access-Control-Allow-Origin is set at all.
 func (s *Server) applyCORS(w http.ResponseWriter, r *http.Request) {
 	const allowHeaders = "Authorization, Content-Type, Idempotency-Key, X-RS-Operator, X-RS-Device, X-RS-Org"
-	if len(s.CORSOrigins) == 0 {
+	if len(s.CORSOrigins) == 0 && s.DevMode {
 		w.Header().Set("Access-Control-Allow-Origin", "*")
 		w.Header().Set("Access-Control-Allow-Headers", allowHeaders)
 		w.Header().Set("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
