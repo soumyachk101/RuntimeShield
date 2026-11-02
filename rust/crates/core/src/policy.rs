@@ -12,7 +12,7 @@ pub const POLICY_SCHEMA_VERSION: u32 = 1;
 /// Keep in sync with `policies/schema/policy.schema.json` (the file is the
 /// canonical artifact distributed to the web editor and the Go control
 /// plane; this constant is the embedded validator used offline).
-pub const POLICY_SCHEMA: &str = r#"{
+pub const POLICY_SCHEMA: &str = r##"{
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://runshield.dev/schemas/policy.v1.json",
   "title": "RuntimeShield Policy v1",
@@ -129,7 +129,7 @@ pub const POLICY_SCHEMA: &str = r#"{
       }
     }
   }
-}"#;
+}"##;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -201,7 +201,13 @@ pub struct Destination {
 impl Destination {
     /// A destination with an empty port list applies to every port.
     pub fn matches(&self, host: &str, port: u16) -> bool {
-        crate::netmatch::host_matches(&self.host, host) && self.ports.is_empty() || self.ports.contains(&port)
+        let host_ok = crate::netmatch::host_matches(&self.host, host);
+        if !host_ok {
+            return false;
+        }
+        // An entry with an empty port list applies to every port;
+        // otherwise the exact port must be listed.
+        self.ports.is_empty() || self.ports.contains(&port)
     }
 }
 
@@ -217,6 +223,16 @@ pub struct NetworkSection {
 
 fn default_network_default() -> NetworkDefault {
     NetworkDefault::Deny
+}
+
+impl Default for NetworkSection {
+    fn default() -> Self {
+        Self {
+            default: default_network_default(),
+            allow: Vec::new(),
+            deny: Vec::new(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -354,10 +370,10 @@ impl Policy {
 pub fn validate_json(doc: &Value) -> Result<()> {
     let schema: Value =
         serde_json::from_str(POLICY_SCHEMA).map_err(|e| Error::InvalidPolicy(e.to_string()))?;
-    let compiled = json_schema::JSONSchema::compile(&schema)
-        .map_err(|e| Error::InvalidPolicy(format!("schema compile: {e}")))?;
-    if !compiled.is_valid(doc) {
-        return Err(Error::InvalidPolicy("document does not match policy JSON schema".into()));
+    if !jsonschema::is_valid(&schema, doc) {
+        return Err(Error::InvalidPolicy(
+            "document does not match policy JSON schema".into(),
+        ));
     }
     Ok(())
 }
