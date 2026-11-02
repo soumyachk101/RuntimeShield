@@ -1,6 +1,6 @@
 use thiserror::Error;
 
-#[derive(Debug, Error, PartialEq)]
+#[derive(Debug, Error)]
 pub enum Error {
     /// The execution request failed structured validation (unknown
     /// capability kind, non-array argv, oversized argument list, ...).
