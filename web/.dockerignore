@@ -1,0 +1,15 @@
+# Applied when the build context is this directory:
+#   docker build -f web/Dockerfile web/
+# NOTE: this context cannot build standalone — the Dockerfile also COPYs
+# deploy/nginx.conf from the product root. The compose build (and the
+# documented command) use the product root as context, where the root
+# .dockerignore is the one the builder actually consumes.
+
+node_modules/
+dist/
+.vite/
+*.log
+.env
+.env.local
+.git/
+.gitignore
