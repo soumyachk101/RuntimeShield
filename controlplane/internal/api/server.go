@@ -134,7 +134,7 @@ func (s *Server) Routes(mux *http.ServeMux) {
 
 	// Operator console: policies, orgs, users, devices, decisions, approvals.
 	op := func(h handleFunc) http.HandlerFunc {
-		return s.limit(classOperator, s.operatorRoute(h))
+		return http.HandlerFunc(s.limit(classOperator, s.operatorRoute(h)))
 	}
 	inner.HandleFunc("/v1/policies", op(s.handlePoliciesDispatch))
 	inner.HandleFunc("/v1/policies/", op(s.handlePoliciesDispatch))
@@ -151,7 +151,7 @@ func (s *Server) Routes(mux *http.ServeMux) {
 		writeError(w, http.StatusNotFound, ErrNotFound, "not found")
 	})
 
-	mux.HandleFunc("/", s.harden(inner))
+	mux.Handle("/", s.harden(inner))
 }
 
 // --- middleware --------------------------------------------------------------
