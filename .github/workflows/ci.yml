@@ -34,6 +34,11 @@ jobs:
       - name: Cargo check (workspace)
         run: cargo check --workspace --all-targets
 
+      - name: cargo audit (dependency vulnerabilities)
+        run: |
+          cargo install cargo-audit --locked
+          cargo audit
+
   controlplane:
     name: go control plane
     runs-on: ubuntu-latest
@@ -64,6 +69,11 @@ jobs:
       - name: go test
         run: go test -mod=mod ./...
 
+      - name: govulncheck (Go dependency vulnerabilities)
+        run: |
+          go install golang.org/x/vuln/cmd/govulncheck@latest
+          govulncheck ./...
+
   web:
     name: web console
     runs-on: ubuntu-latest
@@ -89,3 +99,22 @@ jobs:
 
       - name: Build (vite)
         run: npm run build
+
+      - name: npm audit (JS dependency vulnerabilities)
+        run: npm audit --audit-level=high
+
+  # gitleaks scans the full history for committed secrets. Runs its own
+  # lightweight job so a secret finding does not block the component jobs.
+  secret-scan:
+    name: secret scanning (gitleaks)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: gitleaks
+        uses: gitleaks/gitleaks-action@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
