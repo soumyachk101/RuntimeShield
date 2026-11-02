@@ -137,14 +137,20 @@ func (s *Server) Routes(mux *http.ServeMux) {
 		return s.limit(classOperator, s.operatorRoute(h))
 	}
 	inner.HandleFunc("/v1/policies", op(s.handlePoliciesDispatch))
+	inner.HandleFunc("/v1/policies/", op(s.handlePoliciesDispatch))
 	inner.HandleFunc("/v1/organizations", op(s.handleOrgsList))
 	inner.HandleFunc("/v1/users", op(s.handleUsersList))
 	inner.HandleFunc("/v1/devices", op(s.handleDevicesList))
 	inner.HandleFunc("/v1/decisions", op(s.handleDecisionsList))
 	inner.HandleFunc("/v1/approvals", op(s.handleApprovalsDispatch))
+	inner.HandleFunc("/v1/approvals/", op(s.handleApprovalsDispatch))
 
-	// Unknown paths fall through the inner mux to the hardening wrapper's
-	// default 404 envelope, so error responses carry the same headers.
+	// Catch-all: any path the patterns above didn't match returns the
+	// 404 error envelope (the default mux 404 would be plain text).
+	inner.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+		writeError(w, http.StatusNotFound, ErrNotFound, "not found")
+	})
+
 	mux.HandleFunc("/", s.harden(inner))
 }
 
@@ -184,7 +190,8 @@ func (s *Server) device(class string, exception bool, next handleFunc) handleFun
 			next(w, r)
 		}
 	} else {
-		// Dev mode (open, WARN-logged) or the enrol bootstrap exception.
+		// Dev mode (open, WARN-logged) or the enrol bootstrap exception
+		// (keyed mode, silent: the device has no credential yet).
 		authNext = func(w http.ResponseWriter, r *http.Request) {
 			if !s.keyed() {
 				s.Logger.Warn("dev-mode unauthenticated device request", "path", r.URL.Path)
