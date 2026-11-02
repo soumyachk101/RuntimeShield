@@ -1,0 +1,45 @@
+# Root build context for controlplane/Dockerfile and web/Dockerfile
+# (both are built with `context: .` from the product root).
+#
+# Keep only what the two app images need: the Go control-plane source,
+# the policy schema it loads at startup, the web source, and the nginx
+# config it copies in. Everything else is dropped from the context.
+
+# --- VCS / editor / OS noise ---
+.git/
+.gitignore
+.DS_Store
+
+# --- environment / secret material (never baked into an image) ---
+.env
+.env.local
+controlplane/.env
+controlplane/.env.local
+
+# --- Rust agent: NOT containerised (see infrastructure/AGENT-RELEASE-NOTES.md) ---
+rust/
+
+# --- local data: SQLite files, spool, agent data dir ---
+**/*.db
+**/*.db-wal
+**/*.db-shm
+controlplane/data/
+.runshield/
+spool/
+
+# --- build artifacts (rebuilt inside the images, never shipped) ---
+controlplane/bin/
+controlplane/controlplane
+web/node_modules/
+web/dist/
+web/.vite/
+
+# --- examples: no real secrets (they carry only env-var KEY NAMES, e.g.
+#     AWS_ACCESS_KEY_ID, and no secret VALUES — see deploy/NOTES-AND-GAPS.md),
+#     but they are not inputs to either build ---
+examples/
+
+# --- this packaging tree ---
+deploy/
+infrastructure/
+docker-compose.yml
