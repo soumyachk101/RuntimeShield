@@ -1,0 +1,26 @@
+# Rust
+rust/target/
+*.db
+*.db-wal
+*.db-shm
+
+# Go
+controlplane/bin/
+controlplane/data/
+controlplane/controlplane
+
+# Web
+web/node_modules/
+web/dist/
+web/.vite/
+
+# Local runtime data
+.runshield/
+spool/
+
+# Env
+.env
+.env.local
+
+# OS noise
+.DS_Store
