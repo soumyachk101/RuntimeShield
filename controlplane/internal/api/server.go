@@ -129,7 +129,7 @@ func (s *Server) Routes(mux *http.ServeMux) {
 	inner.HandleFunc("/v1/ready", s.handleReady) // probes: not rate-limited
 	inner.HandleFunc("/v1/devices/enrol", s.device(classEnrol, true, s.handleDevicesEnrol))
 	inner.HandleFunc("/v1/devices/", s.deviceDispatch)
-	inner.HandleFunc("/v1/events/", s.limit(classEvents, s.device(classEvents, false, s.handleEventsBatch)))
+	inner.HandleFunc("/v1/events/", s.device(classEvents, false, s.handleEventsBatch))
 	inner.HandleFunc("/v1/workspaces/", s.device(classDevice, false, s.handleWorkspaceExecutions))
 
 	// Operator console: policies, orgs, users, devices, decisions, approvals.
@@ -151,8 +151,7 @@ func (s *Server) Routes(mux *http.ServeMux) {
 // --- middleware --------------------------------------------------------------
 
 // limit enforces the named rate class before auth so an over-budget
-// caller is rejected cheaply. Allow is check-only; the bucket is
-// consumed on entry.
+// caller is rejected cheaply. The bucket is consumed on entry.
 func (s *Server) limit(class string, next handleFunc) handleFunc {
 	l := s.Limiters[class]
 	if l == nil {
@@ -160,24 +159,21 @@ func (s *Server) limit(class string, next handleFunc) handleFunc {
 	}
 	return func(w http.ResponseWriter, r *http.Request) {
 		key := r.RemoteAddr
-		if l.Allow(key) {
-			l.Consume(key)
-			next(w, r)
+		if !l.Allow(key) {
+			w.Header().Set("Retry-After", strconv.Itoa(l.RetryAfterSeconds(key)))
+			writeError(w, http.StatusTooManyRequests, ErrRateLimited, "rate limit exceeded")
 			return
 		}
-		sec := strconv.Itoa(l.RetryAfterSeconds(key))
-		w.Header().Set("Retry-After", sec)
-		writeError(w, http.StatusTooManyRequests, ErrRateLimited, "rate limit exceeded")
+		next(w, r)
 	}
 }
 
 // device enforces a DEVICE token (keyed mode) and applies the rate class.
 // exception=true marks the bootstrapping enrol (no prior credential).
 func (s *Server) device(class string, exception bool, next handleFunc) handleFunc {
-	authNext := handleFunc(next)
-	if exception {
-		// The very first enrol is the bootstrap exception (spec §6).
-	} else if s.keyed() {
+	var authNext handleFunc
+	if !exception && s.keyed() {
+		// Keyed mode: a valid device token is required.
 		authNext = func(w http.ResponseWriter, r *http.Request) {
 			claims, ok := s.DeviceClaims(w, r)
 			if !ok {
@@ -188,9 +184,11 @@ func (s *Server) device(class string, exception bool, next handleFunc) handleFun
 			next(w, r)
 		}
 	} else {
-		// Dev mode: open, WARN-logged.
+		// Dev mode (open, WARN-logged) or the enrol bootstrap exception.
 		authNext = func(w http.ResponseWriter, r *http.Request) {
-			s.Logger.Warn("dev-mode unauthenticated device request", "path", r.URL.Path)
+			if !s.keyed() {
+				s.Logger.Warn("dev-mode unauthenticated device request", "path", r.URL.Path)
+			}
 			next(w, r)
 		}
 	}
