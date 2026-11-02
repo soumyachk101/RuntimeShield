@@ -1,0 +1,603 @@
+openapi: 3.0.3
+info:
+  title: RuntimeShield Control Plane API
+  version: "1.0"
+  description: >
+    RuntimeShield team control plane: device enrolment, policy
+    distribution, audit ingestion, approvals, and console read APIs.
+    All non-2xx responses use one error envelope
+    {"error":{"code","message"}} with stable codes. Rate limits are
+    per class (events/enrol/heartbeat/device/operator), per remote
+    address, per replica; 429 responses carry Retry-After. Auth: dev
+    mode (no RUNSHIELD_OPERATOR_KEY) is open and stamps responses with
+    X-RS-Dev-Mode: true; keyed mode requires a valid operator or
+    device token (HMAC, short-lived). The only unauthenticated device
+    call in keyed mode is the first POST /v1/devices/enrol
+    (bootstrapping exception).
+
+servers:
+  - url: http://localhost:8080
+    description: local dev
+
+securitySchemes:
+  operatorBearer:
+    type: http
+    scheme: bearer
+    description: >
+      Short-lived operator token (role=operator) signed with
+      RUNSHIELD_OPERATOR_KEY. Accepted via Authorization: Bearer <tok>
+      or the X-RS-Operator header. Required on operator-class routes
+      in keyed mode; ignored in dev mode.
+  deviceBearer:
+    type: http
+    scheme: bearer
+    description: >
+      Short-lived device token (role=device) minted by
+      POST /v1/devices/{id}/token. Required on device-class routes in
+      keyed mode, except the first /v1/devices/enrol
+      (bootstrapping).
+
+paths:
+  /v1/healthz:
+    get:
+      summary: Liveness alias (stable shape; do not change)
+      description: Rate class device. 200 with body even when degraded.
+      security: []
+      responses:
+        "200":
+          description: Health state
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status: { type: string, enum: [ok, degraded] }
+                  backend: { type: string }
+                  nats: { type: boolean }
+                  timestamp: { type: string, format: date-time }
+        "503": { $ref: "#/components/responses/InternalServerError" }
+
+  /v1/ready:
+    get:
+      summary: Readiness probe
+      description: >
+        Not rate-limited. 503 (err_internal) until the store answers,
+        200 {"status":"ready"} after. Point load-balancer health checks
+        here, not at /v1/healthz.
+      security: []
+      responses:
+        "200":
+          description: Ready
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status: { type: string, example: ready }
+                  backend: { type: string }
+        "503": { $ref: "#/components/responses/InternalServerError" }
+
+  /v1/devices/enrol:
+    post:
+      summary: Enrol a device (bootstrapping exception)
+      description: >
+        Rate class enrol (default 5 rps / burst 10). The only
+        device-class call that needs no device token: there is no
+        credential yet to present. Body caps: 16 KiB.
+      security: [{ deviceBearer: [] }]
+      responses:
+        "200":
+          description: Enrolled
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status: { type: string, example: enrolled }
+                  device: { type: string }
+                  org: { type: string }
+        "400": { $ref: "#/components/responses/InvalidRequest" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "413": { $ref: "#/components/responses/PayloadTooLarge" }
+        "429": { $ref: "#/components/responses/RateLimited" }
+
+  /v1/devices/{id}/heartbeat:
+    post:
+      summary: Heartbeat from an enrolled device
+      description: Rate class heartbeat (default 10 rps / burst 20). Requires a valid device token in keyed mode.
+      security: [{ deviceBearer: [] }]
+      parameters:
+        - $ref: "#/components/parameters/DeviceID"
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status: { type: string, example: ok }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "429": { $ref: "#/components/responses/RateLimited" }
+
+  /v1/devices/{id}/policy:
+    get:
+      summary: Latest published policy for the device's org (signed)
+      description: >
+        Rate class device (default 20 rps / burst 40). Requires a
+        valid device token in keyed mode. 200 with document=null when
+        nothing is published; the agent keeps its cache.
+      security: [{ deviceBearer: [] }]
+      parameters:
+        - $ref: "#/components/parameters/DeviceID"
+        - name: organization
+          in: query
+          schema: { type: string }
+          description: Org scope (defaults to the token's org claim).
+      responses:
+        "200":
+          description: Policy (or empty)
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  organization: { type: string }
+                  document: { nullable: true }
+                  signature: { type: string }
+                  version: { type: integer }
+                  expires_in: { type: integer }
+                  note: { type: string }
+        "400": { $ref: "#/components/responses/InvalidRequest" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "429": { $ref: "#/components/responses/RateLimited" }
+
+  /v1/devices/{id}/token:
+    post:
+      summary: Mint a short-lived device token
+      description: >
+        Rate class device. Operator-gated in keyed mode (a device
+        token does not mint its own successor). The query parameter
+        organization becomes the token's org claim.
+      security: [{ operatorBearer: [] }]
+      parameters:
+        - $ref: "#/components/parameters/DeviceID"
+        - name: organization
+          in: query
+          schema: { type: string }
+      responses:
+        "200":
+          description: Issued
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status: { type: string, example: issued }
+                  device: { type: string }
+                  token: { type: string }
+                  expires: { type: string, example: "24h" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "429": { $ref: "#/components/responses/RateLimited" }
+        "503": { $ref: "#/components/responses/InternalServerError" }
+
+  /v1/events/batch:
+    post:
+      summary: Ingest an audit event batch
+      description: >
+        Rate class events (default 50 rps / burst 100 — highest).
+        Body caps: 500 rows and 1 MiB (413 err_payload_too_large).
+        Idempotent: per-event idempotency_key, or the
+        Idempotency-Key header fills blanks. Requires a valid device
+        token in keyed mode — this check enforces the spec §6 trust
+        boundary (a compromised agent cannot forge a trusted audit
+        identity).
+      security: [{ deviceBearer: [] }]
+      parameters:
+        - name: Idempotency-Key
+          in: header
+          schema: { type: string }
+      responses:
+        "200":
+          description: Accepted
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  accepted: { type: integer }
+                  idempotency: { type: string }
+        "400": { $ref: "#/components/responses/InvalidRequest" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "413": { $ref: "#/components/responses/PayloadTooLarge" }
+        "429": { $ref: "#/components/responses/RateLimited" }
+        "500": { $ref: "#/components/responses/InternalServerError" }
+
+  /v1/workspaces/{id}/executions:
+    get:
+      summary: Execution records for a workspace (newest first)
+      description: Rate class device.
+      security: [{ deviceBearer: [] }]
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: { type: string }
+          description: Workspace id (non-empty).
+        - name: limit
+          in: query
+          schema: { type: integer, default: 50 }
+      responses:
+        "200":
+          description: Executions
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  workspace: { type: string }
+                  limit: { type: integer }
+                  items: { type: array, items: { type: object } }
+        "400": { $ref: "#/components/responses/InvalidRequest" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "429": { $ref: "#/components/responses/RateLimited" }
+
+  /v1/policies:
+    get:
+      summary: List policy versions (optionally by org)
+      security: [{ operatorBearer: [] }]
+      parameters:
+        - name: organization
+          in: query
+          schema: { type: string }
+      responses:
+        "200":
+          description: Policy versions
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  items: { type: array, items: { type: object } }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "429": { $ref: "#/components/responses/RateLimited" }
+    post:
+      summary: Create a policy draft (validated + signed)
+      description: >
+        Rate class operator (default 10 rps / burst 20). Body:
+        organization (required) + document (required; the policy
+        document, capped at 1 MiB -> 413 err_payload_too_large).
+        400 err_invalid_request on missing fields or schema failure.
+      security: [{ operatorBearer: [] }]
+      responses:
+        "200":
+          description: Created
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status: { type: string, example: created }
+                  id: { type: string }
+                  version: { type: integer }
+                  status_out: { type: string, example: draft }
+        "400": { $ref: "#/components/responses/InvalidRequest" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "413": { $ref: "#/components/responses/PayloadTooLarge" }
+        "429": { $ref: "#/components/responses/RateLimited" }
+
+  /v1/policies/schema:
+    get:
+      summary: The policy JSON schema (single source of truth for the console editor)
+      security: [{ operatorBearer: [] }]
+      responses:
+        "200":
+          description: Schema document
+          content:
+            application/schema+json:
+              schema: { type: object }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+
+  /v1/policies/{id}:
+    get:
+      summary: One policy document by id
+      security: [{ operatorBearer: [] }]
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: { type: string }
+      responses:
+        "200":
+          description: Policy + parsed document
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  policy: { type: object }
+                  document: {}
+        "400": { $ref: "#/components/responses/InvalidRequest" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "404": { $ref: "#/components/responses/NotFound" }
+
+  /v1/policies/{id}/publish:
+    post:
+      summary: Mark a policy published
+      security: [{ operatorBearer: [] }]
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: { type: string }
+      responses:
+        "200":
+          description: Published
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status: { type: string, example: published }
+                  id: { type: string }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "404": { $ref: "#/components/responses/NotFound" }
+
+  /v1/policies/{id}/rollback:
+    post:
+      summary: Roll a policy back to a prior version
+      security: [{ operatorBearer: [] }]
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: { type: string }
+      responses:
+        "200":
+          description: Rolled back
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status: { type: string, example: rolled_back }
+                  id: { type: string }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "404": { $ref: "#/components/responses/NotFound" }
+
+  /v1/organizations:
+    get:
+      summary: List organizations (empty set today; no provisioning route yet)
+      security: [{ operatorBearer: [] }]
+      responses:
+        "200":
+          description: Orgs
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  items: { type: array, items: { type: object }, example: [] }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+
+  /v1/users:
+    get:
+      summary: List users of an org
+      security: [{ operatorBearer: [] }]
+      parameters:
+        - name: organization
+          in: query
+          schema: { type: string }
+      responses:
+        "200":
+          description: Users
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  items: { type: array, items: { type: object } }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+
+  /v1/devices:
+    get:
+      summary: List enrolled devices (optionally by org)
+      security: [{ operatorBearer: [] }]
+      parameters:
+        - name: organization
+          in: query
+          schema: { type: string }
+      responses:
+        "200":
+          description: Devices
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  items: { type: array, items: { type: object } }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+
+  /v1/decisions:
+    get:
+      summary: Audit decision timeline (filterable, paginated)
+      description: >
+        Query filters: device_id, policy_version, decision,
+        limit (default 200). Rate class operator.
+      security: [{ operatorBearer: [] }]
+      parameters:
+        - name: device_id
+          in: query
+          schema: { type: string }
+        - name: policy_version
+          in: query
+          schema: { type: string }
+        - name: decision
+          in: query
+          schema: { type: string }
+        - name: limit
+          in: query
+          schema: { type: integer, default: 200 }
+      responses:
+        "200":
+          description: Decisions
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  items: { type: array, items: { type: object } }
+                  limit: { type: integer }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "429": { $ref: "#/components/responses/RateLimited" }
+
+  /v1/approvals:
+    get:
+      summary: List approvals by status
+      security: [{ operatorBearer: [] }]
+      parameters:
+        - name: status
+          in: query
+          schema: { type: string, enum: [pending, approved, denied, ""] }
+      responses:
+        "200":
+          description: Approvals
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  items: { type: array, items: { type: object } }
+                  status: { type: string }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+    post:
+      summary: Create a pending approval
+      security: [{ operatorBearer: [] }]
+      responses:
+        "200":
+          description: Approval recorded
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status: { type: string, example: pending }
+                  id: { type: string }
+                  request_id: { type: string }
+                  approver_id: { type: string }
+                  scope: { type: string }
+                  expires_at: { type: string, format: date-time }
+        "400": { $ref: "#/components/responses/InvalidRequest" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+
+  /v1/approvals/{id}/decision:
+    post:
+      summary: Approve or deny a pending approval
+      security: [{ operatorBearer: [] }]
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: { type: string }
+      responses:
+        "200":
+          description: Decision recorded
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status: { type: string, example: recorded }
+                  id: { type: string }
+                  decision: { type: string }
+                  approver_id: { type: string }
+        "400": { $ref: "#/components/responses/InvalidRequest" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "404": { $ref: "#/components/responses/NotFound" }
+
+components:
+  parameters:
+    DeviceID:
+      name: id
+      in: path
+      required: true
+      schema: { type: string }
+      description: Device id (non-empty).
+  responses:
+    Unauthorized:
+      description: Missing/invalid/expired token (keyed mode)
+      headers:
+        X-RS-Dev-Mode:
+          description: "present only in dev mode"
+          schema: { type: string, example: "true" }
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/ErrorEnvelope" }
+          example: { error: { code: err_unauthorized, message: "invalid or expired operator token" } }
+    Forbidden:
+      description: Authenticated but not allowed
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/ErrorEnvelope" }
+          example: { error: { code: err_forbidden, message: "forbidden" } }
+    RateLimited:
+      description: Over the class budget
+      headers:
+        Retry-After:
+          schema: { type: string }
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/ErrorEnvelope" }
+          example: { error: { code: err_rate_limited, message: "rate limit exceeded" } }
+    InvalidRequest:
+      description: Bad JSON or missing required fields/params
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/ErrorEnvelope" }
+          example: { error: { code: err_invalid_request, message: "device_id and public_key are required" } }
+    PayloadTooLarge:
+      description: Body over cap (batch: >1 MiB or >500 rows; policy: >1 MiB)
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/ErrorEnvelope" }
+          example: { error: { code: err_payload_too_large, message: "batch exceeds byte cap" } }
+    NotFound:
+      description: No such resource or route
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/ErrorEnvelope" }
+          example: { error: { code: err_not_found, message: "policy not found" } }
+    Conflict:
+      description: State conflict
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/ErrorEnvelope" }
+          example: { error: { code: err_conflict, message: "conflict" } }
+    InternalServerError:
+      description: Unexpected failure / store not ready
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/ErrorEnvelope" }
+          example: { error: { code: err_internal, message: "store not ready" } }
+  schemas:
+    ErrorEnvelope:
+      type: object
+      required: [error]
+      properties:
+        error:
+          type: object
+          required: [code, message]
+          properties:
+            code:
+              type: string
+              enum:
+                - err_unauthorized
+                - err_forbidden
+                - err_rate_limited
+                - err_invalid_request
+                - err_payload_too_large
+                - err_not_found
+                - err_conflict
+                - err_internal
+            message: { type: string }
