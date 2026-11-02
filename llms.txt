@@ -1,0 +1,74 @@
+# RuntimeShield
+
+RuntimeShield is an AI code-execution security product. A local Rust
+agent enforces policy on each tool/exec call (the security-critical
+path lives entirely in the agent, never in the control plane); this
+repository's Go control plane handles device enrolment, signed policy
+distribution, audit ingestion, and operator approvals. The web console
+is a thin client over the /v1 API.
+
+## Endpoint list (Go control plane, /v1)
+
+Public probes:
+- GET /v1/healthz — liveness alias; stable shape ({"status","backend","nats","timestamp"}). Do not change.
+- GET /v1/ready — readiness probe; 503 until the store answers, 200 after. Not rate-limited.
+
+Device class (short-lived device token in keyed mode; enrol is the bootstrap exception):
+- POST /v1/devices/enrol — enrol a device; no credential required (first call). Body: device_id, public_key, organization, platform, agent_version.
+- POST /v1/devices/{id}/heartbeat — liveness touch for an enrolled device.
+- GET /v1/devices/{id}/policy?organization= — latest signed policy for the org; 200 with document=null when none published.
+- POST /v1/devices/{id}/token?organization= — mint a short-lived device token (operator-gated in keyed mode).
+- POST /v1/events/batch — ingest an audit event batch; capped 500 rows / 1 MiB; idempotent via idempotency_key. Requires a valid device token in keyed mode (the spec §6 trust boundary).
+- GET /v1/workspaces/{id}/executions?limit= — execution records for a workspace, newest first.
+
+Operator class (short-lived operator token in keyed mode):
+- GET /v1/policies?organization= — list policy versions.
+- GET /v1/policies/schema — the policy JSON schema (single source of truth).
+- GET /v1/policies/{id} — one policy document.
+- POST /v1/policies — create a validated + signed draft; body: organization + document (1 MiB cap).
+- POST /v1/policies/{id}/publish — mark published.
+- POST /v1/policies/{id}/rollback — roll back to a prior version.
+- GET /v1/organizations — list orgs (empty set today; no provisioning route yet).
+- GET /v1/users?organization= — members of an org.
+- GET /v1/devices?organization= — enrolled devices.
+- GET /v1/decisions?device_id=&policy_version=&decision=&limit= — audit timeline; limit default 200.
+- GET /v1/approvals?status= — list approvals (pending|approved|denied|"" all).
+- POST /v1/approvals — create a pending approval; body: request_id, scope, reason.
+- POST /v1/approvals/{id}/decision — approve/deny; body: decision (allow|deny), reason.
+
+## Error envelope
+
+Every non-2xx response is one object: {"error":{"code","message"}}.
+Stable codes:
+- err_unauthorized (401), err_forbidden (403), err_rate_limited (429),
+  err_invalid_request (400), err_payload_too_large (413), err_not_found (404),
+  err_conflict (409), err_internal (500/503).
+429 responses carry Retry-After.
+
+## Rate-limit classes
+
+Per remote address, per replica (in-memory token buckets). One class per
+route group; per-class env override RUNSHIELD_RATE_<CLASS>_RPS / _BURST.
+- events (50 rps / burst 100): /v1/events/batch — highest budget.
+- enrol (5 rps / burst 10): /v1/devices/enrol — lowest.
+- heartbeat (10 rps / burst 20): /v1/devices/{id}/heartbeat.
+- device (20 rps / burst 40): device policy-pull, token minting, healthz, workspace executions.
+- operator (10 rps / burst 20): all operator-class routes.
+
+## Auth modes
+
+- Dev mode (no RUNSHIELD_OPERATOR_KEY set, the zero-config default): every
+  route is open; unauthenticated requests log a WARN and responses carry
+  X-RS-Dev-Mode: true. Not for any network boundary.
+- Keyed mode (RUNSHIELD_OPERATOR_KEY set): operator-class routes require a
+  short-lived operator token (HMAC, role=operator); device-class routes
+  require a short-lived device token (role=device, minted by
+  /v1/devices/{id}/token) except the first /v1/devices/enrol. Verification
+  is stateless, so any load-balanced replica can verify any token.
+
+## Links
+
+- Endpoint reference + per-class rate-limit table + curl examples: docs/API.md
+- Scaling model (stateless API + LB, SQLite vs Postgres, per-replica limits, NATS gap, payload caps): docs/SCALING.md
+- Machine-readable OpenAPI 3.0: docs/openapi.yaml
+- Trust model, enforcement limits, known gaps: docs/ARCHITECTURE.md, docs/ENFORCEMENT-LIMITS.md, docs/KNOWN-LIMITATIONS.md
