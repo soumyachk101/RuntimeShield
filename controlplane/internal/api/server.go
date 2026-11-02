@@ -7,22 +7,24 @@
 // presence-check:
 //
 //   - Operator routes verify a short-lived operator token (HMAC, same
-//     scheme as device tokens) in production.
-//   - Device routes verify a short-lived DEVICE token, EXCEPT the very
-//     first enrol, which is the bootstrapping exception (spec §6
+//     scheme as device tokens, spec §10/§11) in keyed mode.
+//   - Device routes verify a short-lived DEVICE token issued by
+//     /v1/devices/{id}/token, EXCEPT the very first enrol, which is the
+//     bootstrapping exception (documented in docs/API.md; spec §6
 //     trust boundary: a compromised agent cannot forge a trusted audit
 //     identity because /v1/events/batch requires a valid device token).
 //
 // Dev mode (no RUNSHIELD_OPERATOR_KEY configured) preserves the open
 // zero-config behaviour: requests pass through, a WARN is logged per
-// unauthenticated request, and every response carries X-RS-Dev-Mode.
+// unauthenticated request, and every response carries X-RS-Dev-Mode: true.
+// When the key IS set, open mode is off and 401/403 use the shared
+// error envelope.
 //
 // No handler touches a policy decision: the security-critical path lives
 // entirely in the Rust agent (spec §5 "important architecture decision").
 package api
 
 import (
-	"context"
 	"crypto/rand"
 	"encoding/hex"
 	"encoding/json"
@@ -53,15 +55,15 @@ const (
 )
 
 // Body size caps. events/batch is capped on both rows and bytes; other
-// POST bodies on bytes only.
+// POST bodies on bytes only (documented in docs/SCALING.md).
 const (
-	maxBatchBytes    = 1 << 20 // 1 MiB
+	maxBatchBytes    = 1 << 20 // 1 MiB, /v1/events/batch
 	maxBatchRows     = 500
-	maxPolicyBytes   = 1 << 20 // 1 MiB
-	maxSmallBodyByte = 16 << 10 // 16 KiB
+	maxPolicyBytes   = 1 << 20 // 1 MiB, POST /v1/policies
+	maxSmallBodyByte = 16 << 10 // 16 KiB, small JSON bodies
 )
 
-// Rate class names (shared with config + docs). See config.RateClassDefaults.
+// Rate class names (shared with config; defaults in config.RateClassDefaults).
 const (
 	classEvents    = "events"
 	classEnrol     = "enrol"
@@ -76,10 +78,10 @@ type Server struct {
 	Policy      *policy.Service
 	Ingest      *events.Ingestor
 	Issuer      *auth.TokenIssuer
-	Operators   *auth.OperatorVerifier // nil in dev mode
-	Devices     *auth.DeviceVerifier   // nil in dev mode
+	Operators   *auth.OperatorVerifier // keyed-mode operator verification
+	Devices     *auth.DeviceVerifier   // keyed-mode device verification
 	Limiters    map[string]*ratelimit.Limiter
-	CORSOrigins []string // empty = dev mode (`*`)
+	CORSOrigins []string // empty = dev mode (CORS `*`)
 	DevMode     bool
 	Logger      *slog.Logger
 }
@@ -113,113 +115,98 @@ func NewServer(d NewServerDeps) *Server {
 	}
 }
 
-// Routes registers all control-plane endpoints on mux. A single catch-all
-// is registered so every response passes through the hardening wrapper
-// (security headers, CORS, dev-mode marker).
-func (s *Server) Routes(mux *http.ServeMux) {
-	m := http.NewServeMux()
-
-	// Public / device-facing, rate-limited per class.
-	m.HandleFunc("/v1/healthz", s.limit(classDevice, s.deviceToken(false, s.handleHealthz)))
-	m.HandleFunc("/v1/ready", s.handleReady) // probes: no rate limit, no auth
-	m.HandleFunc("/v1/devices/enrol", s.limit(classEnrol, s.deviceToken(false, s.handleDevicesEnrol)))
-	m.HandleFunc("/v1/devices/", s.deviceDispatch)
-	m.HandleFunc("/v1/events/", s.limit(classEvents, s.deviceToken(true, s.handleEventsBatch)))
-	m.HandleFunc("/v1/workspaces/", s.limit(classDevice, s.deviceToken(true, s.handleWorkspaceExecutions)))
-
-	// Operator console.
-	op := func(h handleFunc) http.Handler {
-		return s.limit(classOperator, s.operator(h))
-	}
-	m.HandleFunc("/v1/policies", op(s.handlePoliciesDispatch))
-	m.HandleFunc("/v1/organizations", op(s.handleOrgsList))
-	m.HandleFunc("/v1/users", op(s.handleUsersList))
-	m.HandleFunc("/v1/devices", op(s.handleDevicesList))
-	m.HandleFunc("/v1/decisions", op(s.handleDecisionsList))
-	m.HandleFunc("/v1/approvals", op(s.handleApprovalsDispatch))
-
-	mux.HandleFunc("/", s.harden(m))
-}
-
-// handleFunc is a handler that has server access already bound.
+// handleFunc is a handler that already has server access bound.
 type handleFunc func(w http.ResponseWriter, r *http.Request)
 
-// limit wraps a handler with the named rate-limit class. Rate limiting
-// happens before auth so an over-budget caller is rejected cheaply.
-func (s *Server) limit(class string, next handleFunc) http.HandlerFunc {
+// Routes registers all control-plane endpoints on mux. A single catch-all
+// is registered so every response passes through the hardening wrapper
+// (security headers, CORS, dev-mode marker, 404 envelope).
+func (s *Server) Routes(mux *http.ServeMux) {
+	inner := http.NewServeMux()
+
+	// Public / device-facing, rate-limited per class.
+	inner.HandleFunc("/v1/healthz", s.limit(classDevice, s.handleHealthz))
+	inner.HandleFunc("/v1/ready", s.handleReady) // probes: not rate-limited
+	inner.HandleFunc("/v1/devices/enrol", s.device(classEnrol, true, s.handleDevicesEnrol))
+	inner.HandleFunc("/v1/devices/", s.deviceDispatch)
+	inner.HandleFunc("/v1/events/", s.limit(classEvents, s.device(classEvents, false, s.handleEventsBatch)))
+	inner.HandleFunc("/v1/workspaces/", s.device(classDevice, false, s.handleWorkspaceExecutions))
+
+	// Operator console: policies, orgs, users, devices, decisions, approvals.
+	op := func(h handleFunc) http.HandlerFunc {
+		return s.limit(classOperator, s.operatorRoute(h))
+	}
+	inner.HandleFunc("/v1/policies", op(s.handlePoliciesDispatch))
+	inner.HandleFunc("/v1/organizations", op(s.handleOrgsList))
+	inner.HandleFunc("/v1/users", op(s.handleUsersList))
+	inner.HandleFunc("/v1/devices", op(s.handleDevicesList))
+	inner.HandleFunc("/v1/decisions", op(s.handleDecisionsList))
+	inner.HandleFunc("/v1/approvals", op(s.handleApprovalsDispatch))
+
+	// Unknown paths fall through the inner mux to the hardening wrapper's
+	// default 404 envelope, so error responses carry the same headers.
+	mux.HandleFunc("/", s.harden(inner))
+}
+
+// --- middleware --------------------------------------------------------------
+
+// limit enforces the named rate class before auth so an over-budget
+// caller is rejected cheaply. Allow is check-only; the bucket is
+// consumed on entry.
+func (s *Server) limit(class string, next handleFunc) handleFunc {
 	l := s.Limiters[class]
 	if l == nil {
 		return next
 	}
 	return func(w http.ResponseWriter, r *http.Request) {
-		if !l.Allow(r.RemoteAddr) {
-			sec := l.RetryAfterSeconds(r.RemoteAddr)
-			writeError(w, http.StatusTooManyRequests, ErrRateLimited, "rate limit exceeded")
-			w.Header().Set("Retry-After", strconv.Itoa(sec))
+		key := r.RemoteAddr
+		if l.Allow(key) {
+			l.Consume(key)
+			next(w, r)
 			return
 		}
-		next(w, r)
+		sec := strconv.Itoa(l.RetryAfterSeconds(key))
+		w.Header().Set("Retry-After", sec)
+		writeError(w, http.StatusTooManyRequests, ErrRateLimited, "rate limit exceeded")
 	}
 }
 
-// deviceToken enforces a valid DEVICE token (except the enrol exception)
-// in keyed mode. In dev mode it passes through and logs a WARN.
-// isEnrol marks the bootstrapping exception.
-func (s *Server) deviceToken(allowMissingForEnrol bool, next handleFunc) handleFunc {
-	return func(w http.ResponseWriter, r *http.Request) {
-		if s.DevMode {
-			s.Logger.Warn("dev-mode unauthenticated device request", "path", r.URL.Path)
-			next(w, r)
-			return
-		}
-		// The very first enrol is the bootstrap exception: no prior
-		// credential exists to present (spec §6 trust boundary).
-		if allowMissingForEnrol && r.URL.Path == "/v1/devices/enrol" {
-			next(w, r)
-			return
-		}
-		claims, ok := s.verifyDevice(w, r)
-		if !ok {
-			return
-		}
-		if claims != nil {
+// device enforces a DEVICE token (keyed mode) and applies the rate class.
+// exception=true marks the bootstrapping enrol (no prior credential).
+func (s *Server) device(class string, exception bool, next handleFunc) handleFunc {
+	authNext := handleFunc(next)
+	if exception {
+		// The very first enrol is the bootstrap exception (spec §6).
+	} else if s.keyed() {
+		authNext = func(w http.ResponseWriter, r *http.Request) {
+			claims, ok := s.DeviceClaims(w, r)
+			if !ok {
+				return
+			}
 			r.Header.Set("X-RS-Device", claims.DeviceID)
 			r.Header.Set("X-RS-Org", claims.OrgID)
-		}
-		next(w, r)
-	}
-}
-
-// verifyDevice checks the bearer token against the device verifier.
-func (s *Server) verifyDevice(w http.ResponseWriter, r *http.Request) (*auth.DeviceClaims, bool) {
-	if s.Devices == nil {
-		writeError(w, http.StatusUnauthorized, ErrUnauthorized, "device token verification not configured")
-		return nil, false
-	}
-	tok := stripBearer(r.Header.Get("Authorization"))
-	claims, ok := s.Devices.Verify(tok)
-	if !ok {
-		writeError(w, http.StatusUnauthorized, ErrUnauthorized, "invalid or expired device token")
-		return nil, false
-	}
-	return claims, true
-}
-
-// operator wraps operator routes. In keyed mode it requires a valid
-// operator token; in dev mode it passes through with a WARN.
-func (s *Server) operator(next handleFunc) handleFunc {
-	return func(w http.ResponseWriter, r *http.Request) {
-		if s.DevMode {
-			s.Logger.Warn("dev-mode unauthenticated operator request", "path", r.URL.Path)
-			// Preserve today's open behaviour: any non-empty identity.
-			if r.Header.Get("X-RS-Operator") == "" && r.Header.Get("Authorization") == "" {
-				// Still open in dev; leave the header as-is.
-			}
 			next(w, r)
-			return
 		}
-		// Keyed mode: verify a real operator token from Authorization or
-		// X-RS-Operator.
+	} else {
+		// Dev mode: open, WARN-logged.
+		authNext = func(w http.ResponseWriter, r *http.Request) {
+			s.Logger.Warn("dev-mode unauthenticated device request", "path", r.URL.Path)
+			next(w, r)
+		}
+	}
+	return s.limit(class, authNext)
+}
+
+// operatorRoute enforces a real operator token in keyed mode; open +
+// WARN-logged in dev mode (preserves today's zero-config behaviour).
+func (s *Server) operatorRoute(next handleFunc) handleFunc {
+	if !s.keyed() {
+		return func(w http.ResponseWriter, r *http.Request) {
+			s.Logger.Warn("dev-mode unauthenticated operator request", "path", r.URL.Path)
+			next(w, r)
+		}
+	}
+	return func(w http.ResponseWriter, r *http.Request) {
 		if s.Operators == nil {
 			writeError(w, http.StatusUnauthorized, ErrUnauthorized, "operator verification not configured")
 			return
@@ -233,84 +220,60 @@ func (s *Server) operator(next handleFunc) handleFunc {
 			writeError(w, http.StatusUnauthorized, ErrUnauthorized, "invalid or expired operator token")
 			return
 		}
+		// Forward the verified identity; handlers read X-RS-Operator.
 		r.Header.Set("X-RS-Operator", claims.DeviceID)
 		next(w, r)
 	}
 }
 
-// deviceDispatch routes the /v1/devices/ subtree with per-route auth.
+// keyed reports whether real token verification is configured.
+func (s *Server) keyed() bool { return !s.DevMode }
+
+// DeviceClaims verifies the bearer device token, writing a 401 on failure.
+func (s *Server) DeviceClaims(w http.ResponseWriter, r *http.Request) (*auth.DeviceClaims, bool) {
+	if s.Devices == nil {
+		writeError(w, http.StatusUnauthorized, ErrUnauthorized, "device token verification not configured")
+		return nil, false
+	}
+	claims, ok := s.Devices.Verify(stripBearer(r.Header.Get("Authorization")))
+	if !ok {
+		writeError(w, http.StatusUnauthorized, ErrUnauthorized, "invalid or expired device token")
+		return nil, false
+	}
+	return claims, true
+}
+
+// deviceDispatch routes the /v1/devices/ subtree (heartbeat/policy/token).
 func (s *Server) deviceDispatch(w http.ResponseWriter, r *http.Request) {
 	p := r.URL.Path
 	switch {
 	case strings.HasSuffix(p, "/heartbeat") && r.Method == http.MethodPost:
-		if !s.deviceGate(w, r) {
-			return
-		}
-		l := s.Limiters[classHeartbeat]
-		if l != nil && !l.Allow(r.RemoteAddr) {
-			writeError(w, http.StatusTooManyRequests, ErrRateLimited, "rate limit exceeded")
-			w.Header().Set("Retry-After", strconv.Itoa(l.RetryAfterSeconds(r.RemoteAddr)))
-			return
-		}
-		s.handleDeviceHeartbeat(w, r)
+		h := s.device(classHeartbeat, false, s.handleDeviceHeartbeat)
+		h(w, r)
 	case strings.HasSuffix(p, "/policy") && r.Method == http.MethodGet:
-		if !s.deviceGate(w, r) {
-			return
-		}
-		s.gateClass(w, r, classDevice, s.handleDevicePolicy)
+		h := s.device(classDevice, false, s.handleDevicePolicy)
+		h(w, r)
 	case strings.HasSuffix(p, "/token") && r.Method == http.MethodPost:
-		// Token minting is an operator action (a device token cannot mint
-		// its own successor). Rate-limited under the device class.
-		if !s.gateClass(w, r, classDevice, s.operator(s.handleDeviceToken)) {
-			return
-		}
+		// Token minting is an operator action (a device token does not
+		// mint its own successor); it lives on the public path so the
+		// agent can request it, but requires the operator identity in
+		// keyed mode.
+		h := s.limit(classDevice, s.operatorRoute(s.handleDeviceToken))
+		h(w, r)
 	default:
 		writeError(w, http.StatusNotFound, ErrNotFound, "not found")
 	}
 }
 
-// deviceGate enforces a device token and rate limit for the heartbeat path.
-func (s *Server) deviceGate(w http.ResponseWriter, r *http.Request) bool {
-	if s.DevMode {
-		s.Logger.Warn("dev-mode unauthenticated device request", "path", r.URL.Path)
-		return true
-	}
-	if s.Devices == nil {
-		writeError(w, http.StatusUnauthorized, ErrUnauthorized, "device token verification not configured")
-		return false
-	}
-	claims, ok := s.Devices.Verify(stripBearer(r.Header.Get("Authorization")))
-	if !ok {
-		writeError(w, http.StatusUnauthorized, ErrUnauthorized, "invalid or expired device token")
-		return false
-	}
-	r.Header.Set("X-RS-Device", claims.DeviceID)
-	r.Header.Set("X-RS-Org", claims.OrgID)
-	return true
-}
+// --- probes ------------------------------------------------------------------
 
-// gateClass applies a rate class + handler.
-func (s *Server) gateClass(w http.ResponseWriter, r *http.Request, class string, next handleFunc) bool {
-	if l := s.Limiters[class]; l != nil {
-		if !l.Allow(r.RemoteAddr) {
-			writeError(w, http.StatusTooManyRequests, ErrRateLimited, "rate limit exceeded")
-			w.Header().Set("Retry-After", strconv.Itoa(l.RetryAfterSeconds(r.RemoteAddr)))
-			return false
-		}
-	}
-	next(w, r)
-	return true
-}
-
-// handleHealthz: liveness/alias, kept exactly as-is for the web topbar +
-// compose smoke test.
+// handleHealthz: liveness/alias, kept EXACTLY as before the hardening —
+// the web topbar and the compose smoke test depend on this shape.
 func (s *Server) handleHealthz(w http.ResponseWriter, r *http.Request) {
 	dbErr := s.Store.Ping()
 	status := "ok"
-	code := http.StatusOK
 	if dbErr != nil {
 		status = "degraded"
-		code = http.StatusServiceUnavailable
 	}
 	writeJSON(w, map[string]any{
 		"status":    status,
@@ -318,23 +281,22 @@ func (s *Server) handleHealthz(w http.ResponseWriter, r *http.Request) {
 		"nats":      s.Ingest != nil,
 		"timestamp": time.Now().UTC().Format(time.RFC3339),
 	})
-	if code != http.StatusOK {
-		writeError(w, http.StatusServiceUnavailable, ErrInternal, status)
-	}
 }
 
 // handleReady is the readiness probe: 503 until the store answers, 200
-// after. Unlike healthz it is a gate, not an alias.
+// after. It is a gate, not an alias: unlike healthz it fails closed.
 func (s *Server) handleReady(w http.ResponseWriter, r *http.Request) {
 	if err := s.Store.Ping(); err != nil {
-		writeError(w, http.StatusServiceUnavailable, ErrInternal, "store not ready")
+		writeError(w, http.StatusServiceUnavailable, ErrInternal, "store not ready: "+err.Error())
 		return
 	}
 	writeJSON(w, map[string]any{"status": "ready", "backend": s.Store.Backend()})
 }
 
-// handleDevicesEnrol is the bootstrapping exception: the first enrol needs
-// no prior credential (documented in docs/API.md).
+// --- device handlers ---------------------------------------------------------
+
+// handleDevicesEnrol is the bootstrapping exception: the first enrol
+// needs no prior credential (documented in docs/API.md).
 func (s *Server) handleDevicesEnrol(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		writeError(w, http.StatusNotFound, ErrNotFound, "not found")
@@ -376,6 +338,8 @@ func (s *Server) handleDeviceHeartbeat(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, map[string]string{"status": "ok"})
 }
 
+// handleDevicePolicy returns the latest published policy for the
+// requesting device's organization, signed.
 func (s *Server) handleDevicePolicy(w http.ResponseWriter, r *http.Request) {
 	org := r.Header.Get("X-RS-Org")
 	if org == "" {
@@ -412,11 +376,18 @@ func (s *Server) handleDevicePolicy(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+// handleEventsBatch ingests an agent audit batch. The device-token
+// check on this route is what enforces the spec §6 trust boundary: a
+// compromised agent cannot forge a trusted audit identity because every
+// batch must carry a valid, short-lived device credential.
 func (s *Server) handleEventsBatch(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		writeError(w, http.StatusNotFound, ErrNotFound, "not found")
+		return
+	}
 	idem := r.Header.Get("Idempotency-Key")
 	var b events.Batch
 	if err := readCappedJSON(w, r, maxBatchBytes, &b); err != nil {
-		// Distinguish overflow: MaxBytesReader error -> 413 envelope.
 		if isPayloadOverflow(err) {
 			writeError(w, http.StatusRequestEntityTooLarge, ErrPayloadTooLarge, "batch exceeds byte cap")
 			return
@@ -473,6 +444,8 @@ func (s *Server) handleWorkspaceExecutions(w http.ResponseWriter, r *http.Reques
 	})
 }
 
+// handleDeviceToken mints a short-lived device credential (spec §10
+// "short-lived device credentials"). Operator-gated in keyed mode.
 func (s *Server) handleDeviceToken(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		writeError(w, http.StatusNotFound, ErrNotFound, "not found")
@@ -504,6 +477,8 @@ func (s *Server) handleDeviceToken(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+// --- policies ----------------------------------------------------------------
+
 func (s *Server) handlePoliciesDispatch(w http.ResponseWriter, r *http.Request) {
 	path := r.URL.Path
 	switch {
@@ -524,6 +499,9 @@ func (s *Server) handlePoliciesDispatch(w http.ResponseWriter, r *http.Request) 
 	}
 }
 
+// handlePolicySchema returns the raw policy JSON schema the control plane
+// validates against, so the web editor validates locally against the same
+// source of truth (spec §5 "single source of truth").
 func (s *Server) handlePolicySchema(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/schema+json")
 	_, _ = w.Write(s.Policy.Schema())
@@ -549,6 +527,9 @@ func (s *Server) handlePoliciesGet(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, map[string]any{"policy": p, "document": parsed})
 }
 
+// handlePoliciesCreate validates a draft policy document against the
+// schema, signs it and stores a new versioned row. The document byte cap
+// is documented in docs/SCALING.md.
 func (s *Server) handlePoliciesCreate(w http.ResponseWriter, r *http.Request) {
 	var body struct {
 		Organization string          `json:"organization"`
@@ -630,6 +611,8 @@ func (s *Server) handlePoliciesList(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, map[string]any{"items": items})
 }
 
+// --- operator read handlers --------------------------------------------------
+
 func (s *Server) handleOrgsList(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, map[string]any{"items": []any{}})
 }
@@ -654,6 +637,7 @@ func (s *Server) handleDevicesList(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, map[string]any{"items": items})
 }
 
+// handleDecisionsList returns the audit timeline with optional filters.
 func (s *Server) handleDecisionsList(w http.ResponseWriter, r *http.Request) {
 	q := r.URL.Query()
 	limit := 200
@@ -675,6 +659,8 @@ func (s *Server) handleDecisionsList(w http.ResponseWriter, r *http.Request) {
 	}
 	writeJSON(w, map[string]any{"items": items, "limit": limit})
 }
+
+// --- approvals ---------------------------------------------------------------
 
 func (s *Server) handleApprovalsDispatch(w http.ResponseWriter, r *http.Request) {
 	switch {
@@ -778,6 +764,8 @@ func (s *Server) handleApprovalsList(w http.ResponseWriter, r *http.Request) {
 
 // --- hardening wrapper (headers + CORS + dev marker) -------------------------
 
+// harden applies security headers, CORS and the dev-mode marker to every
+// response, including 404s that the inner mux would otherwise serve.
 func (s *Server) harden(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("X-Content-Type-Options", "nosniff")
@@ -787,7 +775,6 @@ func (s *Server) harden(next http.Handler) http.Handler {
 		}
 		s.applyCORS(w, r)
 		if r.Method == http.MethodOptions {
-			w.Header().Set("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
 			w.WriteHeader(http.StatusNoContent)
 			return
 		}
@@ -795,20 +782,21 @@ func (s *Server) harden(next http.Handler) http.Handler {
 	})
 }
 
+// applyCORS keeps `*` only in dev mode; config-driven otherwise.
 func (s *Server) applyCORS(w http.ResponseWriter, r *http.Request) {
 	const allowHeaders = "Authorization, Content-Type, Idempotency-Key, X-RS-Operator, X-RS-Device, X-RS-Org"
-	// Dev mode: open.
 	if len(s.CORSOrigins) == 0 {
 		w.Header().Set("Access-Control-Allow-Origin", "*")
 		w.Header().Set("Access-Control-Allow-Headers", allowHeaders)
+		w.Header().Set("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
 		return
 	}
-	// Config-driven: only echo a matching Origin.
 	origin := r.Header.Get("Origin")
 	for _, o := range s.CORSOrigins {
 		if strings.EqualFold(o, origin) {
 			w.Header().Set("Access-Control-Allow-Origin", origin)
 			w.Header().Set("Access-Control-Allow-Headers", allowHeaders)
+			w.Header().Set("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
 			w.Header().Set("Vary", "Origin")
 			return
 		}
@@ -823,6 +811,7 @@ func writeJSON(w http.ResponseWriter, v any) {
 }
 
 // writeError emits the ONE error envelope: {"error":{"code","message"}}.
+// All non-2xx responses use this; codes are the stable Err* constants.
 func writeError(w http.ResponseWriter, status int, code, message string) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(status)
@@ -831,8 +820,8 @@ func writeError(w http.ResponseWriter, status int, code, message string) {
 	}})
 }
 
-// readCappedJSON decodes a request body of at most `max` bytes. Overflow
-// surfaces as a *http.MaxBytesError.
+// readCappedJSON decodes a request body of at most `max` bytes.
+// Overflow surfaces as a *http.MaxBytesError.
 func readCappedJSON(w http.ResponseWriter, r *http.Request, max int, dst any) error {
 	rd := http.MaxBytesReader(w, r.Body, int64(max))
 	defer rd.Close()
@@ -888,6 +877,3 @@ func newID() string {
 	_, _ = rand.Read(b)
 	return hex.EncodeToString(b)
 }
-
-// ensure context is used (some build modes trim unused imports).
-var _ = context.Background
