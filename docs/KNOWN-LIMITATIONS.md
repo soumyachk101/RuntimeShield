@@ -78,12 +78,18 @@ Nothing here is hedged: each names the file, what it does, and what's missing.
    (`--rs-font-ui` / `--rs-font-mono`). No lockfile ships yet, so the web
    build is not reproducible until `package-lock.json` is committed.
 
-10. **Operator identity is a local setting, not SSO.** The control plane's
-    operator routes require an `X-RS-Operator` header or bearer; this
-    reference build has no SSO/session store, so the console keeps the
-    operator id and organisation scope in `localStorage` (the top bar edits
-    them; a 401 surfaces as a specific permission error state). Real team
-    auth is a later phase (spec §15 / Phase 4).
+10. **Operator identity is keyed, not SSO.** With `RUNSHIELD_OPERATOR_KEY`
+    set, the control plane's operator routes verify a real short-lived
+    operator token (HMAC, same scheme as device tokens) and 401 on
+    failure; device routes verify the device token minted by
+    `/v1/devices/{id}/token`, the first enrol being the documented
+    bootstrap exception. Without the key (zero-config dev mode) the
+    routes stay open and log a WARN per request, stamping responses
+    with `X-RS-Dev-Mode: true`. There is still no SSO/session store:
+    the console keeps the operator id in `localStorage`, and the token
+    itself has to be issued by a holder of the key (no issuance route
+    yet — mint tokens out-of-band). Real team auth is a later phase
+    (spec §15 / Phase 4).
 
 ## Deployment
 
