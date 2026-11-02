@@ -89,19 +89,67 @@ func main() {
 	}
 	issuer := auth.NewTokenIssuer(signKey, 24*time.Hour)
 
-	rl := ratelimit.New(float64(cfg.RateLimitRPS), cfg.RateLimitBurst)
-	server := api.NewServer(st, ps, ingest, issuer, rl, logger)
+	// Dev mode: when no operator key is configured the API stays open
+	// (zero-config local dev) and logs a WARN per unauthenticated
+	// request. When RUNSHIELD_OPERATOR_KEY is set, open mode is off and
+	// operator/device tokens are verified for real.
+	devMode := len(cfg.OperatorKey) == 0
+
+	var operators *auth.OperatorVerifier
+	var devices *auth.DeviceVerifier
+	if !devMode {
+		operators = auth.NewOperatorVerifier(cfg.OperatorKey, 24*time.Hour)
+		// Device tokens are issued under the sign key; verify under the
+		// same key so an issued token verifies on this node.
+		devices = auth.NewDeviceVerifier(signKey, 24*time.Hour)
+	}
+
+	// Per-class rate limiters (documented in docs/SCALING.md).
+	classes := []string{
+		config.ClassEvents, config.ClassEnrol, config.ClassHeartbeat,
+		config.ClassDevice, config.ClassOperator,
+	}
+	limiterMap := map[string]*ratelimit.Limiter{}
+	for _, c := range classes {
+		cr := cfg.RateFor(c)
+		limiterMap[c] = ratelimit.For(float64(cr.RPS), cr.Burst)
+	}
+
+	server := api.NewServer(api.NewServerDeps{
+		Store:       st,
+		Policy:      ps,
+		Ingest:      ingest,
+		Issuer:      issuer,
+		Operators:   operators,
+		Devices:     devices,
+		Limiters:    limiterMap,
+		CORSOrigins: cfg.CORSOrigins(),
+		DevMode:     devMode,
+		Logger:      logger,
+	})
 
 	mux := http.NewServeMux()
 	server.Routes(mux)
 
+	// Production server hygiene: bound header sizes + idle connections
+	// so slowloris / header-flood cannot tie up the listener.
+	httpTimeouts := func() func(*http.Server) {
+		return func(srv *http.Server) {
+			srv.ReadHeaderTimeout = 10 * time.Second
+			srv.ReadTimeout = 30 * time.Second
+			srv.WriteTimeout = 30 * time.Second
+			srv.IdleTimeout = 2 * time.Minute
+			srv.MaxHeaderBytes = 1 << 20
+		}
+	}
+
 	var srv *http.Server
 	if cfg.TLSCert != "" && cfg.TLSKey != "" {
 		srv = &http.Server{
-			Addr:              cfg.HTTPAddr,
-			Handler:           mux,
-			ReadHeaderTimeout: 10 * time.Second,
+			Addr:    cfg.HTTPAddr,
+			Handler: mux,
 		}
+		httpTimeouts()(srv)
 		go func() {
 			logger.Info("control plane listening (TLS)", "addr", cfg.HTTPAddr)
 			if err := srv.ListenAndServeTLS(cfg.TLSCert, cfg.TLSKey); err != nil && !errors.Is(err, http.ErrServerClosed) {
@@ -110,12 +158,12 @@ func main() {
 		}()
 	} else {
 		srv = &http.Server{
-			Addr:              cfg.HTTPAddr,
-			Handler:           mux,
-			ReadHeaderTimeout: 10 * time.Second,
+			Addr:    cfg.HTTPAddr,
+			Handler: mux,
 		}
+		httpTimeouts()(srv)
 		go func() {
-			logger.Info("control plane listening", "addr", cfg.HTTPAddr, "tls", false)
+			logger.Info("control plane listening", "addr", cfg.HTTPAddr, "tls", false, "devMode", devMode)
 			if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
 				logger.Error("serve", "err", err)
 			}
