@@ -1,0 +1,17 @@
+# Applied when the build context is this directory:
+#   docker build -f controlplane/Dockerfile controlplane/
+# NOTE: that context cannot build standalone — the Dockerfile also COPYs
+# policies/schema/ from the product root. The compose build (and the
+# documented command) use the product root as context, where the root
+# .dockerignore is the one the builder actually consumes.
+
+data/
+bin/
+controlplane
+*.db
+*.db-wal
+*.db-shm
+.env
+.env.local
+.git/
+.gitignore
